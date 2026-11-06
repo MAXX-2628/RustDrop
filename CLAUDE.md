@@ -12,7 +12,7 @@ cd Z:\RustDrop; . .\env.ps1
 
 - Keep everything inside `Z:\RustDrop`. Never install tools system-wide (no winget, no user-PATH or registry changes). A new tool goes under `Tools\<name>`, and `env.ps1` gets its PATH and home variable.
 - System dependencies that are already present and can't be moved: VS 2022 Build Tools (MSVC 14.44, Windows SDK 10.0.26100) and the WebView2 runtime.
-- Android: the SDK is in `Toolsndroid-sdk` (platform android-37.0, build-tools 36.0.0 and 37.0.0, NDK 30.0.16248370, CMake 3.31.6). Gradle 9.8.2 is in `Toolsgradle`; use the wrapper. `sdkmanager` is deprecated; install packages with `android --sdk=$env:ANDROID_HOME sdk install <pkg>/<ver>`.
+- Android: the SDK is in `Tools\android-sdk` (platform android-37.0, build-tools 36.0.0 and 37.0.0, NDK 30.0.16248370, CMake 3.31.6). Gradle 9.8.2 is in `Tools\gradle`; use the wrapper. `sdkmanager` is deprecated; install packages with `android --sdk=$env:ANDROID_HOME sdk install <pkg>/<ver>`.
 - Shell is Windows PowerShell 5.1: no `&&`, so use `; if ($?) { ... }`.
 
 ## Commands
@@ -41,15 +41,15 @@ pnpm tauri build              # NSIS installer
 - pnpm 12 enforces a minimum release age. Don't add `minimumReleaseAgeExclude`; pin an older version instead. Project rule: npm packages and crates must be at least 14 days old.
 - A running `rustdrop-windows.exe` locks the release build. Close the app before rebuilding it.
 
-Android app (run these in `android`):
+Android app (run these in `android\`):
 
 ```powershell
-.gradlew assembleDebug     # appbuildoutputspkdebugpp-debug.apk
-.gradlew assembleRelease   # minified with R8; unsigned until a signing config exists
-.gradlew lintDebug         # Android lint; keep it free of errors
+.\gradlew assembleDebug     # app\build\outputs\apk\debug\app-debug.apk
+.\gradlew assembleRelease   # minified with R8; unsigned until a signing config exists
+.\gradlew lintDebug         # Android lint; keep it free of errors
 ```
 
-- `preBuild` runs `cargo ndk` (rustdrop-core with `--features uniffi`, 3 ABIs) and then `uniffi-bindgen`. Their output goes to `appbuildgenerated{jniLibs,uniffi}`.
+- `preBuild` runs `cargo ndk` (rustdrop-core with `--features uniffi`, 3 ABIs) and then `uniffi-bindgen`. Their output goes to `app\build\generated\{jniLibs,uniffi}`.
 - AGP 9 has Kotlin built in. Generated sources must go in `kotlin.directories`, not `java`. Source sets reject Provider values, so pass plain paths.
 - Keep `/*` out of KDoc comments: Kotlin nests block comments, so it opens a second comment that never closes.
 
