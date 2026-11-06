@@ -14,7 +14,7 @@ use std::{
     },
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::{
     runtime::{Builder, Handle, Runtime},
     sync::{mpsc, oneshot, watch},
@@ -134,6 +134,9 @@ pub trait Listener: Send + Sync {
     fn peers_changed(&self, peers: Vec<PeerInfo>);
     fn incoming(&self, request: IncomingRequest);
     fn transfer_changed(&self, update: TransferUpdate);
+    /// Clipboard text arrived from the paired device `from`; put it on the system clipboard.
+    /// Only called while clipboard sync is on. Never log `text`.
+    fn clipboard_received(&self, text: String, from: String);
     /// A device finished QR pairing with this one (it scanned this device's code).
     fn paired(&self, name: String);
     /// The node stopped working (for example, it could not open a network socket).
@@ -166,12 +169,24 @@ struct Inner {
     /// Wanted state; the UI turns discovery off when nobody is looking (saves battery).
     discover: AtomicBool,
     discovery: Mutex<Option<Discovery>>,
+    settings_path: PathBuf,
+    clipboard_sync: AtomicBool,
+    /// SHA-256 of the last clipboard text sent or received: stops echoes between devices.
+    last_clip: Mutex<Option<Vec<u8>>>,
 }
 
 #[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
 pub struct Node {
     inner: Arc<Inner>,
     _runtime: Runtime,
+}
+
+/// User settings kept in `settings.json` in the data folder.
+#[derive(Serialize, Deserialize, Default)]
+struct Settings {
+    /// SECURITY.md §10: clipboard sync is opt-in.
+    #[serde(default)]
+    clipboard_sync: bool,
 }
 
 /// Preferred listening port (falls back to any free port).
@@ -236,6 +251,12 @@ impl Node {
         let data_dir = PathBuf::from(data_dir);
         let identity = Identity::load_or_create(&data_dir, device_name.as_deref())
             .map_err(|e| fail(format!("Couldn't load this device's identity: {e:#}")))?;
+        let settings_path = data_dir.join("settings.json");
+        // Missing or unreadable settings fall back to the defaults (everything opt-in is off).
+        let settings: Settings = std::fs::read(&settings_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
         let trust = TrustStore::load(data_dir.join("trusted.json"))
             .map_err(|e| fail(format!("Couldn't load trusted devices: {e:#}")))?;
         // Two workers are plenty for a LAN app; one per core would only add idle threads.
@@ -260,6 +281,9 @@ impl Node {
             port: Mutex::default(),
             discover: AtomicBool::new(true),
             discovery: Mutex::default(),
+            clipboard_sync: AtomicBool::new(settings.clipboard_sync),
+            settings_path,
+            last_clip: Mutex::default(),
         });
         let node = inner.clone();
         runtime.spawn(async move {
@@ -414,6 +438,55 @@ impl Node {
         }
     }
 
+    /// Whether this device shares its clipboard with paired devices (off until the user turns it on).
+    pub fn clipboard_sync(&self) -> bool {
+        self.inner.clipboard_sync.load(Ordering::SeqCst)
+    }
+
+    pub fn set_clipboard_sync(&self, enabled: bool) -> Result<(), NodeError> {
+        let settings = Settings {
+            clipboard_sync: enabled,
+        };
+        let bytes = serde_json::to_vec_pretty(&settings).map_err(|e| fail(e.to_string()))?;
+        std::fs::write(&self.inner.settings_path, bytes)
+            .map_err(|e| fail(format!("Couldn't save the setting: {e}")))?;
+        self.inner.clipboard_sync.store(enabled, Ordering::SeqCst);
+        if !enabled {
+            *self.inner.last_clip.lock().unwrap() = None;
+        }
+        Ok(())
+    }
+
+    /// Call when this device's clipboard text changed. If sync is on, sends it to every paired
+    /// device currently listed. Text that just arrived from another device is not sent back.
+    pub fn clipboard_changed(&self, text: String) {
+        if !self.clipboard_sync() || text.is_empty() || text.len() > server::MAX_CLIPBOARD {
+            return;
+        }
+        if !self.inner.remember_clip(&text) {
+            return;
+        }
+        let targets: Vec<SocketAddr> = {
+            let peers = self.inner.peers.lock().unwrap();
+            peers
+                .values()
+                .filter(|p| p.info.trusted == Some(true))
+                .map(|p| p.addr)
+                .collect()
+        };
+        let text = Arc::new(text);
+        for addr in targets {
+            let (node, text) = (self.inner.clone(), text.clone());
+            self.inner.rt.spawn(async move {
+                if let Err(e) =
+                    server::send_clipboard(addr, &node.identity, node.trust.clone(), &text).await
+                {
+                    tracing::debug!(%addr, "clipboard not delivered: {e:#}"); // the error, never the text
+                }
+            });
+        }
+    }
+
     /// Turns mDNS announce/browse on or off. Receiving stays on; paired devices that already
     /// know this device can still reach it. Mobile UIs turn this off in the background to save battery.
     pub fn set_discovery(&self, enabled: bool) {
@@ -500,6 +573,19 @@ impl Node {
 }
 
 impl Inner {
+    /// Records `text` as the last synced clipboard; false if it already was (an echo).
+    fn remember_clip(&self, text: &str) -> bool {
+        let hash = ::ring::digest::digest(&::ring::digest::SHA256, text.as_bytes())
+            .as_ref()
+            .to_vec();
+        let mut last = self.last_clip.lock().unwrap();
+        if last.as_deref() == Some(hash.as_slice()) {
+            return false;
+        }
+        *last = Some(hash);
+        true
+    }
+
     fn start_discovery(self: &Arc<Self>) {
         let Some(port) = *self.port.lock().unwrap() else {
             return; // run() starts discovery once the listener is bound
@@ -701,6 +787,12 @@ impl Inner {
                 self.pending.lock().unwrap().remove(&transfer_id);
                 cancelled_update(transfer_id, by_peer)
             }
+            Event::Clipboard { text, from } => {
+                if self.clipboard_sync.load(Ordering::SeqCst) && self.remember_clip(&text) {
+                    self.listener.clipboard_received(text, from);
+                }
+                return;
+            }
             Event::Paired { name } => {
                 self.listener.paired(name);
                 self.recheck_all();
@@ -804,7 +896,11 @@ mod tests {
     use crate::server::tests::temp_dir;
 
     #[derive(Default)]
-    struct Recorder(Mutex<Vec<TransferUpdate>>, Mutex<Vec<String>>);
+    struct Recorder(
+        Mutex<Vec<TransferUpdate>>,
+        Mutex<Vec<String>>,
+        Mutex<Vec<String>>,
+    );
 
     impl Listener for Recorder {
         fn peers_changed(&self, _: Vec<PeerInfo>) {}
@@ -814,6 +910,9 @@ mod tests {
         }
         fn paired(&self, name: String) {
             self.1.lock().unwrap().push(name);
+        }
+        fn clipboard_received(&self, text: String, _from: String) {
+            self.2.lock().unwrap().push(text);
         }
         fn failed(&self, _: String) {}
     }
@@ -897,6 +996,77 @@ mod tests {
         c.set_discovery(false);
         assert!(c.pair_with_link(offer.link).is_err());
         assert_eq!(b.trusted().len(), 1);
+    }
+
+    /// Two nodes paired by QR code that list each other (mDNS off).
+    fn paired_nodes() -> (Arc<Node>, Arc<Node>, Arc<Recorder>, Arc<Recorder>) {
+        let (ra, rb) = (Arc::new(Recorder::default()), Arc::new(Recorder::default()));
+        let (a, b) = (
+            new_node("Phone", ra.clone()),
+            new_node("Laptop", rb.clone()),
+        );
+        a.set_discovery(false);
+        b.set_discovery(false);
+        let offer = (0..100)
+            .find_map(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                b.start_pairing().ok()
+            })
+            .expect("listener never became ready");
+        a.pair_with_link(offer.link).unwrap();
+        a.refresh();
+        b.refresh();
+        let listed = |n: &Node| n.peers().iter().any(|p| p.trusted == Some(true));
+        assert!(
+            (0..100).any(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                listed(&a) && listed(&b)
+            }),
+            "nodes never listed each other"
+        );
+        (a, b, ra, rb)
+    }
+
+    fn wait_for(f: impl Fn() -> bool) -> bool {
+        (0..100).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            f()
+        })
+    }
+
+    #[test]
+    fn clipboard_sync_is_opt_in_and_does_not_echo() {
+        let (a, b, ra, rb) = paired_nodes();
+
+        // Off by default on both sides: nothing moves.
+        assert!(!a.clipboard_sync() && !b.clipboard_sync());
+        a.clipboard_changed("secret".into());
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(rb.2.lock().unwrap().is_empty());
+
+        a.set_clipboard_sync(true).unwrap();
+        b.set_clipboard_sync(true).unwrap();
+        a.clipboard_changed("hello from phone".into());
+        assert!(wait_for(
+            || *rb.2.lock().unwrap() == vec!["hello from phone".to_string()]
+        ));
+
+        // b's OS reports the text it just received as a local change: it must not bounce back.
+        b.clipboard_changed("hello from phone".into());
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(ra.2.lock().unwrap().is_empty());
+
+        // A new copy on b does reach a.
+        b.clipboard_changed("reply from laptop".into());
+        assert!(wait_for(
+            || *ra.2.lock().unwrap() == vec!["reply from laptop".to_string()]
+        ));
+
+        // Turning it off on the receiver stops delivery.
+        b.set_clipboard_sync(false).unwrap();
+        a.clipboard_changed("after opt-out".into());
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(rb.2.lock().unwrap().len(), 1);
     }
 
     #[test]

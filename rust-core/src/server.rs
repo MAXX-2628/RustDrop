@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, ensure, Context, Result};
 use rustls::{pki_types::ServerName, ClientConfig};
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
@@ -28,6 +28,8 @@ const MAX_CONNECTIONS: usize = 16;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Largest clipboard text synced (64 KiB); longer copies are not sent.
+pub const MAX_CLIPBOARD: usize = 64 * 1024;
 
 pub async fn listen(
     listener: TcpListener,
@@ -102,6 +104,11 @@ async fn serve(
         match msg {
             Message::Ping { nonce } => {
                 protocol::write(&mut tls, &Message::Pong { nonce }).await?;
+            }
+            Message::Clipboard { text } => {
+                ensure!(text.len() <= MAX_CLIPBOARD, "clipboard text too large");
+                let from = trusted.name.clone();
+                inbox.notify(Event::Clipboard { text, from }).await;
             }
             Message::SendRequest { transfer_id, files } => {
                 let received =
@@ -201,6 +208,19 @@ pub async fn connect(
         security::client_config(identity, trust, None)?,
     )
     .await
+}
+
+/// Sends clipboard text to a trusted peer.
+pub async fn send_clipboard(
+    addr: SocketAddr,
+    identity: &Identity,
+    trust: Arc<TrustStore>,
+    text: &str,
+) -> Result<()> {
+    let (mut tls, _) = connect(addr, identity, trust).await?;
+    protocol::write(&mut tls, &Message::Clipboard { text: text.into() }).await?;
+    let _ = tls.shutdown().await;
+    Ok(())
 }
 
 /// Connects to a trusted peer and exchanges one PING/PONG. Returns the peer and round-trip time.

@@ -66,6 +66,10 @@ pub enum Message {
         transfer_id: Uuid,
         reason: String,
     },
+    /// Clipboard sync: plain text copied on the sender (only between paired devices, opt-in on both).
+    Clipboard {
+        text: String,
+    },
     /// QR pairing: the one-time code read from the QR. The only message an untrusted peer may send.
     PairRequest {
         code: String,

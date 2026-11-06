@@ -82,6 +82,8 @@ export const api = {
   cancel: (id: string) => invoke<void>("cancel", { id }),
   startPairing: () => invoke<PairingOffer>("start_pairing"),
   stopPairing: () => invoke<void>("stop_pairing"),
+  clipboardSync: () => invoke<boolean>("clipboard_sync"),
+  setClipboardSync: (enabled: boolean) => invoke<void>("set_clipboard_sync", { enabled }),
   openDownloads: () => invoke<void>("open_downloads"),
   reveal: (path: string) => invoke<void>("reveal", { path }),
 };
@@ -92,6 +94,8 @@ export const events = {
   transfer: (f: (u: TransferUpdate) => void) => listen<TransferUpdate>("transfer", (e) => f(e.payload)),
   fatal: (f: (message: string) => void) => listen<string>("fatal", (e) => f(e.payload)),
   paired: (f: (name: string) => void) => listen<string>("paired", (e) => f(e.payload)),
+  /** Clipboard text arrived from the named paired device (the text itself is not sent to the UI). */
+  clipboard: (f: (from: string) => void) => listen<string>("clipboard", (e) => f(e.payload)),
 };
 
 export const ACTIVE: TransferState[] = ["WAITING_FOR_ACCEPT", "TRANSFERRING", "VERIFYING"];

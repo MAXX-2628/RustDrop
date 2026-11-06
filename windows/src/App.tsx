@@ -3,6 +3,7 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   CircleAlert,
+  Clipboard,
   CircleCheck,
   Clock,
   Copy,
@@ -67,6 +68,10 @@ export function App() {
   const [dropTarget, setDropTarget] = useState<string | null>(null);
   const [pairName, setPairName] = useState("");
   const [lastPaired, setLastPaired] = useState<{ name: string; at: number } | null>(null);
+  const [clipSync, setClipSyncState] = useState(false);
+  const [clipFrom, setClipFrom] = useState<string | null>(null);
+  const setClipSync = (on: boolean) =>
+    api.setClipboardSync(on).then(() => setClipSyncState(on)).catch((e) => setNotice({ tone: "error", text: String(e) }));
 
   const peersRef = useRef(peers);
   peersRef.current = peers;
@@ -108,6 +113,7 @@ export function App() {
       if (m.error) setFatal(m.error);
     });
     api.peers().then(setPeers);
+    api.clipboardSync().then(setClipSyncState);
     reloadTrusted();
     const stopSearching = setTimeout(() => setSearching(false), 4000);
     const subs = [
@@ -118,6 +124,10 @@ export function App() {
         if (u.state && u.state !== "WAITING_FOR_ACCEPT") setRequests((q) => q.filter((r) => r.id !== u.id));
       }),
       events.fatal(setFatal),
+      events.clipboard((from) => {
+        setClipFrom(from);
+        setTimeout(() => setClipFrom(null), 3000);
+      }),
       events.paired((name) => {
         setLastPaired({ name, at: Date.now() });
         reloadTrusted();
@@ -259,6 +269,9 @@ export function App() {
           )}
           {view === "home" && (
             <HomeView
+              clipSync={clipSync}
+              clipFrom={clipFrom}
+              onPauseClipboard={() => setClipSync(false)}
               me={me}
               peers={peers}
               searching={searching}
@@ -291,7 +304,7 @@ export function App() {
               onPairedShown={() => setLastPaired(null)}
             />
           )}
-          {view === "settings" && me && <SettingsView me={me} />}
+          {view === "settings" && me && <SettingsView me={me} clipSync={clipSync} setClipSync={setClipSync} />}
         </main>
       </div>
       {requests[0] && <IncomingDialog key={requests[0].id} request={requests[0]} onAnswer={respond} />}
@@ -300,6 +313,9 @@ export function App() {
 }
 
 function HomeView(props: {
+  clipSync: boolean;
+  clipFrom: string | null;
+  onPauseClipboard: () => void;
   me: Me | null;
   peers: Peer[];
   searching: boolean;
@@ -326,6 +342,15 @@ function HomeView(props: {
           <span className="dot" aria-hidden />
           Ready to receive from paired devices
         </p>
+        {props.clipSync && (
+          <p className="status" role="status">
+            <Clipboard size={16} aria-hidden />
+            {props.clipFrom ? `Clipboard updated from ${props.clipFrom}` : "Clipboard sync is on"}
+            <button className="btn tertiary" onClick={props.onPauseClipboard}>
+              Pause
+            </button>
+          </p>
+        )}
       </header>
 
       <section className="nearby" aria-labelledby="nearby-title">
@@ -872,7 +897,7 @@ function QrImage({ offer }: { offer: PairingOffer }) {
   );
 }
 
-function SettingsView({ me }: { me: Me }) {
+function SettingsView({ me, clipSync, setClipSync }: { me: Me; clipSync: boolean; setClipSync: (on: boolean) => void }) {
   const [theme, setThemeState] = useState<ThemePreference>(savedTheme());
   const choose = (t: ThemePreference) => {
     setThemeState(t);
@@ -883,6 +908,18 @@ function SettingsView({ me }: { me: Me }) {
       <header className="page-head">
         <h1>Settings</h1>
       </header>
+      <section className="panel" aria-labelledby="clip-title">
+        <h2 id="clip-title">Clipboard</h2>
+        <label className="switch">
+          <input type="checkbox" checked={clipSync} onChange={(e) => setClipSync(e.target.checked)} />
+          <span className="switch-track" aria-hidden />
+          Sync clipboard with paired devices
+        </label>
+        <p className="caption">
+          Text you copy goes to paired devices nearby, and text copied there comes here. Only text, over the
+          encrypted connection. RustDrop keeps no history. Turn it on on each device that should take part.
+        </p>
+      </section>
       <section className="panel" aria-labelledby="theme-title">
         <h2 id="theme-title">Appearance</h2>
         <div className="segmented" role="radiogroup" aria-labelledby="theme-title">

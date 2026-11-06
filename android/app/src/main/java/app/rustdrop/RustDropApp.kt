@@ -1,8 +1,12 @@
 package app.rustdrop
 
 import android.app.Application
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Intent
 import android.net.wifi.WifiManager
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import app.rustdrop.core.IncomingRequest
 import app.rustdrop.core.Listener
@@ -70,9 +74,14 @@ object Core {
     val pairingOffer = MutableStateFlow<PairingOffer?>(null)
     val pairingMessage = MutableStateFlow<String?>(null)
 
+    /** Clipboard sync (opt-in), and the device the last clipboard text came from (shown for 3 s). */
+    val clipboardSync = MutableStateFlow(false)
+    val clipboardFrom = MutableStateFlow<String?>(null)
+
     private val outgoingDirs = mutableMapOf<String, File>()
     private val received get() = File(app.filesDir, "received")
     private var multicast: WifiManager.MulticastLock? = null
+    private val main = Handler(Looper.getMainLooper())
 
     fun start(application: Application) {
         app = application
@@ -92,6 +101,7 @@ object Core {
         }
         me.value = node.me()
         trusted.value = node.trusted()
+        clipboardSync.value = node.clipboardSync()
         watchForegroundService()
     }
 
@@ -194,6 +204,18 @@ object Core {
         node.respond(id, false)
     }
 
+    fun setClipboardSync(on: Boolean) {
+        if (!started) return
+        runCatching { node.setClipboardSync(on) }
+            .onSuccess { clipboardSync.value = on }
+            .onFailure { notice.value = it.message }
+    }
+
+    /** This phone's clipboard changed (read while RustDrop is on screen, as Android requires). */
+    fun clipboardChanged(text: String) {
+        if (started && clipboardSync.value) node.clipboardChanged(text)
+    }
+
     fun cancel(id: String) {
         if (started) node.cancel(id)
     }
@@ -258,6 +280,19 @@ object Core {
                         merge(update(update.id, TransferState.FAILED, "Received, but couldn't save to Downloads. Free up space and try again."))
                     }
                 }
+            }
+        }
+
+        override fun clipboardReceived(text: String, from: String) {
+            // Writing the clipboard is allowed from the background; only reading is restricted.
+            main.post {
+                app.getSystemService(ClipboardManager::class.java)
+                    .setPrimaryClip(ClipData.newPlainText("RustDrop", text))
+            }
+            clipboardFrom.value = from
+            scope.launch {
+                delay(3000)
+                if (clipboardFrom.value == from) clipboardFrom.value = null
             }
         }
 

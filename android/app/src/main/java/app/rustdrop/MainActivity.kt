@@ -70,6 +70,7 @@ class MainActivity : ComponentActivity() {
             },
             showQr = Core::startPairing,
             hideQr = Core::stopPairing,
+            setClipboardSync = Core::setClipboardSync,
         )
         setContent {
             RustDropTheme {
@@ -78,13 +79,36 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // Android lets only the app on screen read the clipboard, so sync reads it on focus and on change.
+    private val clipboard by lazy { getSystemService(ClipboardManager::class.java) }
+    private val clipListener = ClipboardManager.OnPrimaryClipChangedListener { shareClipboard() }
+    private var lastClipStamp = 0L
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) shareClipboard()
+    }
+
+    private fun shareClipboard() {
+        if (!Core.clipboardSync.value) return
+        val clip = clipboard.primaryClip ?: return
+        // Skip a clip already read, so focusing the app doesn't re-read (and re-toast) the same copy.
+        val stamp = clip.description.timestamp
+        if (stamp == lastClipStamp || clip.itemCount == 0) return
+        lastClipStamp = stamp
+        val text = clip.getItemAt(0).coerceToText(this)?.toString() ?: return
+        Core.clipboardChanged(text)
+    }
+
     // Discovery and the multicast lock only while visible (battery); see Core.setVisible.
     override fun onStart() {
         super.onStart()
         Core.setVisible(true)
+        clipboard.addPrimaryClipChangedListener(clipListener)
     }
 
     override fun onStop() {
+        clipboard.removePrimaryClipChangedListener(clipListener)
         Core.setVisible(false)
         super.onStop()
     }

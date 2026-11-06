@@ -1,5 +1,8 @@
 package app.rustdrop.ui
 
+import com.composables.icons.lucide.Clipboard
+import androidx.compose.material3.Switch
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.ui.semantics.liveRegion
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.draw.shadow
@@ -135,6 +138,7 @@ class Actions(
     val scanQr: () -> Unit,
     val showQr: () -> Unit,
     val hideQr: () -> Unit,
+    val setClipboardSync: (Boolean) -> Unit,
 )
 
 private enum class Tab(val label: String, val icon: ImageVector) {
@@ -232,6 +236,7 @@ private fun HomeScreen(
                     Box(Modifier.size(8.dp).background(palette.success, CircleShape))
                     Text("Ready to receive from paired devices", color = palette.textSecondary)
                 }
+                ClipboardStatus(actions)
             }
         }
         item { SendActions(actions, null) }
@@ -705,6 +710,8 @@ private fun SettingsScreen(
 
         item { qrPairing() }
 
+        item { ClipboardSettings(actions) }
+
         item {
             Panel("Your fingerprint") {
                 Text("Compare it with what the other device shows before you pair.", style = MaterialTheme.typography.bodySmall, color = palette.textSecondary)
@@ -820,6 +827,40 @@ private fun SettingsScreen(
                 Text("Version: ${me.version}", color = palette.textSecondary)
             }
         }
+    }
+}
+
+/** "Clipboard sync is on" with Pause, shown on Home while sync runs (SECURITY.md §10: clear indicator). */
+@Composable
+private fun ClipboardStatus(actions: Actions) {
+    val on by Core.clipboardSync.collectAsStateWithLifecycle()
+    val from by Core.clipboardFrom.collectAsStateWithLifecycle()
+    if (!on) return
+    val palette = LocalPalette.current
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(LocalSpacing.current.sm)) {
+        Icon(Lucide.Clipboard, contentDescription = null, Modifier.size(16.dp), tint = palette.textSecondary)
+        Text(from?.let { "Clipboard updated from $it" } ?: "Clipboard sync is on", color = palette.textSecondary, modifier = Modifier.weight(1f, fill = false))
+        TextButton(onClick = { actions.setClipboardSync(false) }) { Text("Pause") }
+    }
+}
+
+@Composable
+private fun ClipboardSettings(actions: Actions) {
+    val on by Core.clipboardSync.collectAsStateWithLifecycle()
+    Panel("Clipboard") {
+        Row(
+            Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                .toggleable(value = on, onValueChange = actions.setClipboardSync, role = Role.Switch),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("Sync clipboard with paired devices", Modifier.weight(1f), fontWeight = FontWeight.SemiBold)
+            Switch(checked = on, onCheckedChange = null)
+        }
+        Text(
+            "Text you copy goes to paired devices nearby, and text copied there comes here. Android only lets RustDrop read the clipboard while it is open. Only text, nothing is stored.",
+            style = MaterialTheme.typography.bodySmall,
+            color = LocalPalette.current.textSecondary,
+        )
     }
 }
 

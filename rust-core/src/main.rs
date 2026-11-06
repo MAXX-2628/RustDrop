@@ -146,6 +146,7 @@ async fn show_events(mut events: mpsc::Receiver<Event>) {
             Event::Failed { reason, .. } => println!("\ntransfer failed: {reason}"),
             Event::Paired { name } => println!("\npaired with {name}"),
             Event::Cancelled { .. } => println!("\ntransfer cancelled"),
+            Event::Clipboard { .. } => {} // the CLI does not sync the clipboard
         }
     }
 }

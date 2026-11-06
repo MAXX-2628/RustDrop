@@ -9,6 +9,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use arboard::SetExtWindows;
 use rustdrop_core::{
     config,
     node::{
@@ -90,6 +91,15 @@ impl Listener for Events {
         }
         drop(peers);
         let _ = self.app.emit("transfer", update);
+    }
+    fn clipboard_received(&self, text: String, from: String) {
+        // Kept out of Win+V history and cloud clipboard (SECURITY.md §10). The watcher sees this
+        // write, but the core ignores it because it matches the text just received.
+        let written =
+            arboard::Clipboard::new().and_then(|mut c| c.set().exclude_from_history().text(text));
+        if written.is_ok() {
+            let _ = self.app.emit("clipboard", from);
+        }
     }
     fn paired(&self, name: String) {
         let _ = self.app.emit("paired", name);
@@ -186,6 +196,41 @@ fn reveal(path: PathBuf) -> Answer<()> {
     Ok(())
 }
 
+#[tauri::command]
+fn clipboard_sync(node: State<Shared>) -> bool {
+    node.clipboard_sync()
+}
+
+#[tauri::command]
+fn set_clipboard_sync(node: State<Shared>, enabled: bool) -> Answer<()> {
+    node.set_clipboard_sync(enabled).map_err(|e| e.to_string())
+}
+
+/// Polls the clipboard every 500 ms while sync is on (DESIGN target: under 500 ms latency).
+/// shortcut: polling, not AddClipboardFormatListener; switch if idle CPU ever matters.
+fn watch_clipboard(node: Shared) {
+    std::thread::spawn(move || {
+        let mut last: Option<String> = None;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if !node.clipboard_sync() {
+                last = None;
+                continue;
+            }
+            let Ok(text) = arboard::Clipboard::new().and_then(|mut c| c.get_text()) else {
+                continue; // not text, or another app holds the clipboard right now
+            };
+            if last.as_deref() != Some(text.as_str()) {
+                // The first read after turning sync on is what was already there: don't send it.
+                if last.is_some() {
+                    node.clipboard_changed(text.clone());
+                }
+                last = Some(text);
+            }
+        }
+    });
+}
+
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -200,6 +245,7 @@ fn main() {
                     peers: Mutex::default(),
                 }),
             )?;
+            watch_clipboard(node.clone());
             app.manage(node);
             Ok(())
         })
@@ -215,6 +261,8 @@ fn main() {
             cancel,
             start_pairing,
             stop_pairing,
+            clipboard_sync,
+            set_clipboard_sync,
             open_downloads,
             reveal
         ])

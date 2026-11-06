@@ -74,6 +74,11 @@ pub enum Event {
     Paired {
         name: String,
     },
+    /// Clipboard text from the paired device `from` (contents are never logged).
+    Clipboard {
+        text: String,
+        from: String,
+    },
     /// The transfer stopped because someone cancelled it. `by_peer`: the sender did, not this device.
     Cancelled {
         transfer_id: Uuid,
