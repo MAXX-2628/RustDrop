@@ -21,7 +21,12 @@ tokio-rustls.workspace = true
 rcgen.workspace = true
 ring.workspace = true
 mdns-sd.workspace = true
+uniffi = { workspace = true, optional = true }
 
 [[bin]]
 name = "rustdrop"
 path = "src/main.rs"
+
+[features]
+# Kotlin bindings for the Android app (see android/uniffi-bindgen).
+uniffi = ["dep:uniffi"]

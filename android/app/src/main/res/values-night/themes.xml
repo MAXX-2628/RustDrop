@@ -1,0 +1,6 @@
+<resources>
+    <!-- matches shared/design colors.json (dark) -->
+    <style name="Theme.RustDrop" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#101319</item>
+    </style>
+</resources>

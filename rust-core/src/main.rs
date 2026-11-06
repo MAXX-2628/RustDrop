@@ -30,7 +30,7 @@ async fn main() -> Result<()> {
         .init();
 
     let home = data_dir();
-    let identity = Arc::new(Identity::load_or_create(&home)?);
+    let identity = Arc::new(Identity::load_or_create(&home, None)?);
     let trust = Arc::new(TrustStore::load(home.join("trusted.json"))?);
     let args: Vec<String> = std::env::args().skip(1).collect();
 

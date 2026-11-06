@@ -24,7 +24,8 @@ pub struct Identity {
 
 impl Identity {
     /// Loads the identity from `dir`, generating and persisting it on first run.
-    pub fn load_or_create(dir: &Path) -> Result<Self> {
+    /// `name` is used only on first run; otherwise the computer name is used.
+    pub fn load_or_create(dir: &Path, name: Option<&str>) -> Result<Self> {
         fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         let (meta, cert, key) = (
             dir.join("identity.json"),
@@ -39,7 +40,7 @@ impl Identity {
             fs::write(&cert, ck.cert.der())?;
             let stored = Stored {
                 id: Uuid::new_v4(),
-                name: default_name(),
+                name: name.map_or_else(default_name, Into::into),
             };
             fs::write(&meta, serde_json::to_vec_pretty(&stored)?)?;
         }

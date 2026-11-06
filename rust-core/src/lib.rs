@@ -3,10 +3,14 @@
 pub mod config;
 pub mod discovery;
 pub mod identity;
+pub mod node;
 pub mod protocol;
 pub mod security;
 pub mod server;
 pub mod transfer;
+
+#[cfg(feature = "uniffi")]
+uniffi::setup_scaffolding!();
 
 /// Application version, shared with platform front-ends.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

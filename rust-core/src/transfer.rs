@@ -91,6 +91,7 @@ impl Inbox {
 
 /// Transfer states shown by every UI (ARCHITECTURE.md §11).
 #[derive(serde::Serialize, Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TransferState {
     WaitingForAccept,

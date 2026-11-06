@@ -1,0 +1,6 @@
+<resources>
+    <!-- Window background before Compose draws; matches shared/design colors.json (light). -->
+    <style name="Theme.RustDrop" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">#F7F9FC</item>
+    </style>
+</resources>

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["rust-core", "windows/src-tauri"]
+members = ["rust-core", "windows/src-tauri", "android/uniffi-bindgen"]
 
 [workspace.package]
 version = "0.1.0"
@@ -21,3 +21,4 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 rcgen = { version = "0.13", default-features = false, features = ["ring", "crypto"] }
 ring = "0.17"
 mdns-sd = "0.13"
+uniffi = "=0.32.2"

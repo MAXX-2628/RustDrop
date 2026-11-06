@@ -31,6 +31,7 @@ $paths = @(
     "$Tools\pnpm",
     "$Tools\pnpm-home",
     "$Tools\jdk\bin",
+    "$Tools\gradle\bin",
     "$Tools\android-sdk\platform-tools",
     "$Tools\android-sdk\cmdline-tools\latest\bin"
 )

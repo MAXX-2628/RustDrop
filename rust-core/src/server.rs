@@ -155,7 +155,7 @@ pub(crate) mod tests {
 
     pub(crate) fn node(tag: &str) -> (Arc<Identity>, Arc<TrustStore>) {
         let dir = temp_dir(tag);
-        let id = Identity::load_or_create(&dir).unwrap();
+        let id = Identity::load_or_create(&dir, None).unwrap();
         let trust = TrustStore::load(dir.join("trusted.json")).unwrap();
         (Arc::new(id), Arc::new(trust))
     }

@@ -11,8 +11,3 @@ tauri-build = { version = "2", features = [] }
 rustdrop-core = { path = "../../rust-core" }
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "=2.8.3"
-tokio.workspace = true
-serde.workspace = true
-uuid.workspace = true
-anyhow.workspace = true
-mdns-sd.workspace = true

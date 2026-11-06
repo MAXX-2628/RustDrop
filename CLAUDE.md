@@ -12,7 +12,7 @@ cd Z:\RustDrop; . .\env.ps1
 
 - Keep everything inside `Z:\RustDrop`. Never install tools system-wide (no winget, no user-PATH or registry changes). A new tool goes under `Tools\<name>`, and `env.ps1` gets its PATH and home variable.
 - System dependencies that are already present and can't be moved: VS 2022 Build Tools (MSVC 14.44, Windows SDK 10.0.26100) and the WebView2 runtime.
-- Android: the SDK is in `Tools\android-sdk` (platform android-37.0, build-tools 37.0.0, NDK 30.0.16248370, CMake 3.31.6). `sdkmanager` is deprecated; install packages with `android --sdk=$env:ANDROID_HOME sdk install <pkg>/<ver>`.
+- Android: the SDK is in `Toolsndroid-sdk` (platform android-37.0, build-tools 36.0.0 and 37.0.0, NDK 30.0.16248370, CMake 3.31.6). Gradle 9.8.2 is in `Toolsgradle`; use the wrapper. `sdkmanager` is deprecated; install packages with `android --sdk=$env:ANDROID_HOME sdk install <pkg>/<ver>`.
 - Shell is Windows PowerShell 5.1: no `&&`, so use `; if ($?) { ... }`.
 
 ## Commands
@@ -41,7 +41,17 @@ pnpm tauri build              # NSIS installer
 - pnpm 12 enforces a minimum release age. Don't add `minimumReleaseAgeExclude`; pin an older version instead. Project rule: npm packages and crates must be at least 14 days old.
 - A running `rustdrop-windows.exe` locks the release build. Close the app before rebuilding it.
 
-Android (later phase): `.\gradlew assembleDebug` in `android\`.
+Android app (run these in `android`):
+
+```powershell
+.gradlew assembleDebug     # appbuildoutputspkdebugpp-debug.apk
+.gradlew assembleRelease   # minified with R8; unsigned until a signing config exists
+.gradlew lintDebug         # Android lint; keep it free of errors
+```
+
+- `preBuild` runs `cargo ndk` (rustdrop-core with `--features uniffi`, 3 ABIs) and then `uniffi-bindgen`. Their output goes to `appbuildgenerated{jniLibs,uniffi}`.
+- AGP 9 has Kotlin built in. Generated sources must go in `kotlin.directories`, not `java`. Source sets reject Provider values, so pass plain paths.
+- Keep `/*` out of KDoc comments: Kotlin nests block comments, so it opens a second comment that never closes.
 
 ## Architecture
 
@@ -66,10 +76,21 @@ The big picture:
     - Files are staged in `<dest>/.rustdrop-<id>/` and only moved into place after verification. Existing files are never overwritten; a new file gets a ` (n)` suffix instead.
     - The UI receives an `Event` stream and approves a request by sending `true` on its `oneshot` channel.
 - Core modules still to build (ARCHITECTURE §5): QUIC transport (TCP+TLS for now), transfer resume, receiver-side cancel, clipboard and device_manager.
-- Windows app: `windows\src-tauri\src\main.rs` is a thin shell over the core.
-  - It runs listen, advertise and browse; then it PINGs each discovered peer to learn its paired status.
-  - It exposes commands (`me`, `peers`, `trusted`, `pair`, `unpair`, `refresh`, `respond`, `send`, `cancel`, `open_downloads`, `reveal`) and emits events (`peers`, `incoming`, `transfer`, `fatal`).
-  - `transfer` events are partial updates; `windows\src\App.tsx` merges their non-null fields by `id`.
+- `node` holds the app logic both platforms share.
+  - `Node::new(data_dir, downloads_dir, device_name, listener)` owns a tokio runtime. It runs listen, advertise and browse, then PINGs each discovered peer to learn whether it's paired.
+  - It exposes `me`, `peers`, `trusted`, `pair`, `unpair`, `refresh`, `respond`, `send` and `cancel`.
+  - It reports back through the `Listener` trait: `peers_changed`, `incoming`, `transfer_changed` and `failed`.
+  - `TransferUpdate` is a partial update; UIs merge its non-null fields by `id`.
+  - With `--features uniffi`, the same types are exported to Kotlin in package `app.rustdrop.core`. Settings are in `rust-core\uniffi.toml`, including `android = true`. `NodeError` is a `flat_error`, so Kotlin sees its Display text.
+- Windows app: `windows\src-tauri\src\main.rs` is a thin Tauri shell over `node`.
+  - Its `Listener` emits webview events (`peers`, `incoming`, `transfer`, `fatal`), and each command calls the matching `Node` method.
+  - Two commands live only in the shell: `open_downloads` and `reveal`.
+- Android app: `android\app\src\main\java\app\rustdrop\`.
+  - `Core` (in `RustDropApp.kt`) creates the `Node` and exposes `StateFlow`s to Compose.
+  - The `Application` holds a multicast lock; without it Android drops mDNS packets.
+  - `Files.kt` copies picked or shared content URIs into cache before sending. Received files are verified in app storage, then published to `Download/RustDrop` through MediaStore; a local copy is deleted only after it's fully written.
+  - `TransferService` is a dataSync foreground service that runs while any transfer is active.
+  - minSdk is 29, the lowest that allows MediaStore Downloads without a storage permission.
   - Don't name a command after a local variable in `main()`. The generated macro picks up the variable instead (this happened with `trust`).
   - `reveal` only opens paths inside the downloads folder.
   - The UI reads its styles from `shared\design\*.json`, applied as CSS variables by `windows\src\tokens.ts`.

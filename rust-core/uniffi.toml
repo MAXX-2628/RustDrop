@@ -1,0 +1,4 @@
+[bindings.kotlin]
+package_name = "app.rustdrop.core"
+# Android-aware code: picks the JNA cleaner below API 33 with an explicit SDK_INT check.
+android = true
