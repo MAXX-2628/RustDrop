@@ -1,0 +1,33 @@
+# Portable toolchains (see env.ps1)
+/Tools/
+
+# Rust
+/target/
+
+# Node / Tauri
+node_modules/
+dist/
+windows/src-tauri/target/
+
+# Android / Gradle
+.gradle/
+local.properties
+android/**/build/
+*.apk
+*.aab
+
+# Secrets — never commit (SECURITY.md §15)
+*.keystore
+*.jks
+*.pfx
+*.pem
+*.key
+.env
+.env.*
+
+# Editors / OS
+.idea/
+.vscode/
+*.iml
+Thumbs.db
+.DS_Store

@@ -1,0 +1,22 @@
+[package]
+name = "rustdrop-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "rustdrop_core"
+crate-type = ["lib", "cdylib"]
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[[bin]]
+name = "rustdrop"
+path = "src/main.rs"
