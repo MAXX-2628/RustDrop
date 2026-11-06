@@ -32,6 +32,13 @@ export interface Trusted {
   name: string;
 }
 
+export interface PairingOffer {
+  link: string;
+  size: number;
+  /** size x size cells, row by row, true = dark */
+  modules: boolean[];
+}
+
 export interface FileMeta {
   path: string;
   size: number;
@@ -73,6 +80,8 @@ export const api = {
   respond: (id: string, accept: boolean) => invoke<void>("respond", { id, accept }),
   send: (device: string, paths: string[]) => invoke<string>("send", { device, paths }),
   cancel: (id: string) => invoke<void>("cancel", { id }),
+  startPairing: () => invoke<PairingOffer>("start_pairing"),
+  stopPairing: () => invoke<void>("stop_pairing"),
   openDownloads: () => invoke<void>("open_downloads"),
   reveal: (path: string) => invoke<void>("reveal", { path }),
 };
@@ -82,6 +91,7 @@ export const events = {
   incoming: (f: (r: IncomingRequest) => void) => listen<IncomingRequest>("incoming", (e) => f(e.payload)),
   transfer: (f: (u: TransferUpdate) => void) => listen<TransferUpdate>("transfer", (e) => f(e.payload)),
   fatal: (f: (message: string) => void) => listen<string>("fatal", (e) => f(e.payload)),
+  paired: (f: (name: string) => void) => listen<string>("paired", (e) => f(e.payload)),
 };
 
 export const ACTIVE: TransferState[] = ["WAITING_FOR_ACCEPT", "TRANSFERRING", "VERIFYING"];

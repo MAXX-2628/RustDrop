@@ -9,6 +9,7 @@ import app.rustdrop.core.Listener
 import app.rustdrop.core.Me
 import app.rustdrop.core.Node
 import app.rustdrop.core.NodeException
+import app.rustdrop.core.PairingOffer
 import app.rustdrop.core.PeerInfo
 import app.rustdrop.core.TransferState
 import app.rustdrop.core.TransferUpdate
@@ -16,6 +17,7 @@ import app.rustdrop.core.TrustedInfo
 import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -23,6 +25,7 @@ import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /** Transfer as the UI shows it; built by merging core [TransferUpdate]s. */
 data class Transfer(
@@ -43,6 +46,7 @@ data class Transfer(
 val ACTIVE = setOf(TransferState.WAITING_FOR_ACCEPT, TransferState.TRANSFERRING, TransferState.VERIFYING)
 
 private const val REQUEST_TIMEOUT_MS = 60_000L // matches the core's DECISION_TIMEOUT
+private const val BACKGROUND_PAUSE_MS = 30_000L
 
 /** Process-wide state: the Rust node and the flows the UI observes. */
 object Core {
@@ -62,11 +66,20 @@ object Core {
     val preparing = MutableStateFlow(false)
     val notice = MutableStateFlow<String?>(null)
 
+    /** QR pairing: the code this phone is showing, and the outcome to report. */
+    val pairingOffer = MutableStateFlow<PairingOffer?>(null)
+    val pairingMessage = MutableStateFlow<String?>(null)
+
     private val outgoingDirs = mutableMapOf<String, File>()
     private val received get() = File(app.filesDir, "received")
+    private var multicast: WifiManager.MulticastLock? = null
 
     fun start(application: Application) {
         app = application
+        // Android drops incoming multicast (mDNS) packets unless an app holds this lock.
+        multicast = app.getSystemService(WifiManager::class.java)
+            ?.createMulticastLock("rustdrop-discovery")
+            ?.apply { setReferenceCounted(false) }
         Files.clearOutgoing(app)
         val name = Settings.Global.getString(app.contentResolver, Settings.Global.DEVICE_NAME)
             ?: android.os.Build.MODEL
@@ -82,6 +95,57 @@ object Core {
     }
 
     val started get() = ::node.isInitialized
+
+    /**
+     * Discovery and the multicast lock run only while RustDrop is on screen: the lock wakes the
+     * Wi-Fi radio for every multicast packet on the network. Transfers keep running over TCP.
+     */
+    fun setVisible(visible: Boolean) {
+        backgroundPause?.cancel()
+        if (visible) {
+            multicast?.acquire()
+            if (started) node.setDiscovery(true)
+            return
+        }
+        // Wait before pausing: pickers and the QR scanner also hide this screen briefly,
+        // and a send right after picking needs the device list.
+        backgroundPause = scope.launch {
+            delay(BACKGROUND_PAUSE_MS)
+            if (started) node.setDiscovery(false)
+            multicast?.let { if (it.isHeld) it.release() }
+            stopPairing()
+        }
+    }
+
+    private var backgroundPause: Job? = null
+
+    fun startPairing() {
+        pairingMessage.value = null
+        pairingOffer.value = try {
+            node.startPairing()
+        } catch (e: NodeException) {
+            pairingMessage.value = e.message
+            null
+        }
+    }
+
+    fun stopPairing() {
+        if (pairingOffer.value != null) {
+            pairingOffer.value = null
+            if (started) node.stopPairing()
+        }
+    }
+
+    /** Pairs with the device whose QR code was scanned. Blocks, so it runs on the IO dispatcher. */
+    suspend fun pairWithLink(link: String) = withContext(Dispatchers.IO) {
+        pairingMessage.value = try {
+            val name = node.pairWithLink(link)
+            trusted.value = node.trusted()
+            "Paired with $name."
+        } catch (e: NodeException) {
+            e.message
+        }
+    }
 
     fun send(device: String, paths: List<String>) {
         try {
@@ -171,6 +235,12 @@ object Core {
             }
         }
 
+        override fun paired(name: String) {
+            pairingOffer.value = null
+            pairingMessage.value = "Paired with $name."
+            trusted.value = node.trusted()
+        }
+
         override fun failed(message: String) {
             fatal.value = message
         }
@@ -190,17 +260,8 @@ object Core {
 }
 
 class RustDropApp : Application() {
-    private var multicast: WifiManager.MulticastLock? = null
-
     override fun onCreate() {
         super.onCreate()
-        // Android drops incoming multicast (mDNS) packets unless an app holds this lock.
-        multicast = getSystemService(WifiManager::class.java)
-            ?.createMulticastLock("rustdrop-discovery")
-            ?.apply {
-                setReferenceCounted(false)
-                acquire()
-            }
         Core.start(this)
     }
 }

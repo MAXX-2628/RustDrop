@@ -1,4 +1,5 @@
 //! Authenticated sessions: accept peers (HELLO -> HELLO_ACK, then PINGs and transfers) and connect to peers.
+//! An untrusted peer only gets this far while a QR pairing window is open, and may then only pair.
 
 use std::{
     net::SocketAddr,
@@ -7,9 +8,9 @@ use std::{
 };
 
 use anyhow::{bail, Context, Result};
-use rustls::pki_types::ServerName;
+use rustls::{pki_types::ServerName, ClientConfig};
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::Semaphore,
     time::timeout,
@@ -19,8 +20,8 @@ use tokio_rustls::{client, TlsAcceptor, TlsConnector};
 use crate::{
     identity::Identity,
     protocol::{self, check_version, DeviceInfo, Message},
-    security::{self, TrustStore},
-    transfer::{self, Inbox},
+    security::{self, PairingWindow, TrustStore},
+    transfer::{self, Event, Inbox},
 };
 
 const MAX_CONNECTIONS: usize = 16;
@@ -33,8 +34,10 @@ pub async fn listen(
     identity: Arc<Identity>,
     trust: Arc<TrustStore>,
     inbox: Arc<Inbox>,
+    pairing: Arc<PairingWindow>,
 ) -> Result<()> {
-    let acceptor = TlsAcceptor::from(security::server_config(&identity, trust.clone())?);
+    let config = security::server_config(&identity, trust.clone(), pairing.clone())?;
+    let acceptor = TlsAcceptor::from(config);
     let slots = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
         let (tcp, addr) = listener.accept().await?;
@@ -43,10 +46,10 @@ pub async fn listen(
             continue;
         };
         let (acceptor, me) = (acceptor.clone(), identity.info());
-        let (inbox, trust) = (inbox.clone(), trust.clone());
+        let (inbox, trust, pairing) = (inbox.clone(), trust.clone(), pairing.clone());
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(e) = serve(acceptor, tcp, me, &inbox, &trust).await {
+            if let Err(e) = serve(acceptor, tcp, me, &inbox, &trust, &pairing).await {
                 tracing::warn!(%addr, "session closed: {e:#}");
             }
         });
@@ -59,23 +62,31 @@ async fn serve(
     me: DeviceInfo,
     inbox: &Inbox,
     trust: &TrustStore,
+    pairing: &PairingWindow,
 ) -> Result<()> {
     let mut tls = timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await??;
-    // The handshake only succeeds for pinned certificates, so this lookup always finds the peer.
-    let trusted_name = tls
+    let fp = tls
         .get_ref()
         .1
         .peer_certificates()
         .and_then(|certs| certs.first())
-        .and_then(|cert| trust.get(&security::fingerprint(cert)))
-        .map(|device| device.name)
-        .context("peer certificate missing from trust store")?;
+        .map(|cert| security::fingerprint(cert))
+        .context("peer sent no certificate")?;
     let peer = match timeout(IDLE_TIMEOUT, protocol::read(&mut tls)).await?? {
         Message::Hello(peer) => peer,
         other => bail!("expected HELLO, got {other:?}"),
     };
     check_version(&peer)?;
     protocol::write(&mut tls, &Message::HelloAck(me)).await?;
+
+    // The handshake admits unknown certificates only during a pairing window.
+    let Some(trusted) = trust.get(&fp) else {
+        let msg = timeout(IDLE_TIMEOUT, protocol::read(&mut tls)).await??;
+        let Message::PairRequest { code } = msg else {
+            bail!("untrusted device sent {msg:?}");
+        };
+        return accept_pairing(&mut tls, &peer, &fp, &code, trust, pairing, inbox).await;
+    };
     tracing::info!(peer = %peer.name, "trusted peer connected");
 
     loop {
@@ -89,11 +100,47 @@ async fn serve(
                 protocol::write(&mut tls, &Message::Pong { nonce }).await?;
             }
             Message::SendRequest { transfer_id, files } => {
-                transfer::receive(&mut tls, &peer, &trusted_name, transfer_id, files, inbox)
+                transfer::receive(&mut tls, &peer, &trusted.name, transfer_id, files, inbox)
                     .await?;
+            }
+            Message::PairRequest { code } => {
+                return accept_pairing(&mut tls, &peer, &fp, &code, trust, pairing, inbox).await;
             }
             other => bail!("unexpected message {other:?}"),
         }
+    }
+}
+
+/// Redeems a QR code and trusts the peer under its HELLO name.
+async fn accept_pairing<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    peer: &DeviceInfo,
+    fp: &str,
+    code: &str,
+    trust: &TrustStore,
+    pairing: &PairingWindow,
+    inbox: &Inbox,
+) -> Result<()> {
+    if !pairing.redeem(code) {
+        let _ = protocol::write(stream, &Message::PairReject).await;
+        bail!("wrong or expired pairing code");
+    }
+    // Keep a name the user already chose; only new devices get the name they announce.
+    let name = trust.get(fp).map_or_else(|| label(&peer.name), |d| d.name);
+    trust.add(fp, &name)?;
+    protocol::write(stream, &Message::PairAccept).await?;
+    inbox.notify(Event::Paired { name }).await;
+    Ok(())
+}
+
+/// A peer-chosen name, made safe to store and display.
+fn label(name: &str) -> String {
+    let clean: String = name.chars().filter(|c| !c.is_control()).take(64).collect();
+    let clean = clean.trim();
+    if clean.is_empty() {
+        "New device".into()
+    } else {
+        clean.into()
     }
 }
 
@@ -102,17 +149,19 @@ fn is_eof(e: &anyhow::Error) -> bool {
         .is_some_and(|e| e.kind() == std::io::ErrorKind::UnexpectedEof)
 }
 
-/// Opens an authenticated session with a trusted peer and exchanges HELLO.
-pub async fn connect(
+async fn open(
     addr: SocketAddr,
     identity: &Identity,
-    trust: Arc<TrustStore>,
+    config: Arc<ClientConfig>,
 ) -> Result<(client::TlsStream<TcpStream>, DeviceInfo)> {
-    let connector = TlsConnector::from(security::client_config(identity, trust)?);
     let tcp = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await??;
     // Peers are pinned by fingerprint, so the name only has to be syntactically valid.
     let name = ServerName::try_from("rustdrop")?;
-    let mut tls = timeout(HANDSHAKE_TIMEOUT, connector.connect(name, tcp)).await??;
+    let mut tls = timeout(
+        HANDSHAKE_TIMEOUT,
+        TlsConnector::from(config).connect(name, tcp),
+    )
+    .await??;
 
     protocol::write(&mut tls, &Message::Hello(identity.info())).await?;
     let peer = match timeout(IDLE_TIMEOUT, protocol::read(&mut tls)).await?? {
@@ -121,6 +170,20 @@ pub async fn connect(
     };
     check_version(&peer)?;
     Ok((tls, peer))
+}
+
+/// Opens an authenticated session with a trusted peer and exchanges HELLO.
+pub async fn connect(
+    addr: SocketAddr,
+    identity: &Identity,
+    trust: Arc<TrustStore>,
+) -> Result<(client::TlsStream<TcpStream>, DeviceInfo)> {
+    open(
+        addr,
+        identity,
+        security::client_config(identity, trust, None)?,
+    )
+    .await
 }
 
 /// Connects to a trusted peer and exchanges one PING/PONG. Returns the peer and round-trip time.
@@ -141,13 +204,37 @@ pub async fn ping(
     Ok((peer, rtt))
 }
 
+/// Client side of QR pairing: connects to the device whose fingerprint `pin` came from its QR code,
+/// presents the one-time `code`, and on success trusts that device. Returns it.
+pub async fn pair(
+    addr: SocketAddr,
+    identity: &Identity,
+    trust: Arc<TrustStore>,
+    pin: &str,
+    code: &str,
+) -> Result<DeviceInfo> {
+    let config = security::client_config(identity, trust.clone(), Some(pin.into()))?;
+    let (mut tls, peer) = open(addr, identity, config).await?;
+    protocol::write(&mut tls, &Message::PairRequest { code: code.into() }).await?;
+    match timeout(IDLE_TIMEOUT, protocol::read(&mut tls)).await?? {
+        Message::PairAccept => {}
+        Message::PairReject => {
+            bail!(
+                "The pairing code was wrong or has expired. Show a new QR code and scan it again."
+            )
+        }
+        other => bail!("expected PAIR_ACCEPT, got {other:?}"),
+    }
+    trust.add(pin, &label(&peer.name))?;
+    let _ = tls.shutdown().await;
+    Ok(peer)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use std::path::PathBuf;
     use tokio::sync::mpsc;
-
-    use crate::transfer::Event;
 
     pub(crate) fn temp_dir(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("rustdrop-test-{tag}-{}", uuid::Uuid::new_v4()))
@@ -160,17 +247,25 @@ pub(crate) mod tests {
         (Arc::new(id), Arc::new(trust))
     }
 
-    /// Starts a listener; returns its address and the receiver's event stream.
-    pub(crate) async fn start(
-        id: Arc<Identity>,
-        trust: Arc<TrustStore>,
-        dest: PathBuf,
-    ) -> (SocketAddr, mpsc::Receiver<Event>) {
-        let (tx, rx) = mpsc::channel(16);
+    pub(crate) struct Started {
+        pub addr: SocketAddr,
+        pub events: mpsc::Receiver<Event>,
+        pub pairing: Arc<PairingWindow>,
+    }
+
+    /// Starts a listener; returns its address, the receiver's events and its pairing window.
+    pub(crate) async fn start(id: Arc<Identity>, trust: Arc<TrustStore>, dest: PathBuf) -> Started {
+        let (tx, events) = mpsc::channel(16);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(listen(listener, id, trust, Arc::new(Inbox::new(dest, tx))));
-        (addr, rx)
+        let pairing = Arc::new(PairingWindow::default());
+        let inbox = Arc::new(Inbox::new(dest, tx));
+        tokio::spawn(listen(listener, id, trust, inbox, pairing.clone()));
+        Started {
+            addr,
+            events,
+            pairing,
+        }
     }
 
     #[tokio::test]
@@ -180,8 +275,8 @@ pub(crate) mod tests {
         a_trust.add(&b.fingerprint(), "b").unwrap();
         b_trust.add(&a.fingerprint(), "a").unwrap();
 
-        let (addr, _events) = start(b.clone(), b_trust, temp_dir("dest")).await;
-        let (peer, _) = ping(addr, &a, a_trust).await.unwrap();
+        let s = start(b.clone(), b_trust, temp_dir("dest")).await;
+        let (peer, _) = ping(s.addr, &a, a_trust).await.unwrap();
         assert_eq!(peer.device_id, b.id);
     }
 
@@ -191,8 +286,8 @@ pub(crate) mod tests {
         let (b, b_trust) = node("b");
         a_trust.add(&b.fingerprint(), "b").unwrap(); // a trusts b, b does not trust a
 
-        let (addr, _events) = start(b, b_trust, temp_dir("dest")).await;
-        assert!(ping(addr, &a, a_trust).await.is_err());
+        let s = start(b, b_trust, temp_dir("dest")).await;
+        assert!(ping(s.addr, &a, a_trust).await.is_err());
     }
 
     #[tokio::test]
@@ -201,7 +296,91 @@ pub(crate) mod tests {
         let (b, b_trust) = node("b");
         b_trust.add(&a.fingerprint(), "a").unwrap(); // b trusts a, a does not trust b
 
-        let (addr, _events) = start(b, b_trust, temp_dir("dest")).await;
-        assert!(ping(addr, &a, a_trust).await.is_err());
+        let s = start(b, b_trust, temp_dir("dest")).await;
+        assert!(ping(s.addr, &a, a_trust).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn qr_pairing_trusts_both_ways_once() {
+        let (a, a_trust) = node("a");
+        let (b, b_trust) = node("b");
+        let mut s = start(b.clone(), b_trust.clone(), temp_dir("dest")).await;
+        let code = s.pairing.open().unwrap();
+
+        let peer = pair(s.addr, &a, a_trust.clone(), &b.fingerprint(), &code)
+            .await
+            .unwrap();
+        assert_eq!(peer.device_id, b.id);
+        assert!(a_trust.get(&b.fingerprint()).is_some());
+        assert!(b_trust.get(&a.fingerprint()).is_some());
+        assert!(matches!(s.events.recv().await, Some(Event::Paired { .. })));
+        assert!(ping(s.addr, &a, a_trust).await.is_ok());
+
+        // The code is single-use, and the window is closed for everyone else.
+        let (c, c_trust) = node("c");
+        assert!(pair(s.addr, &c, c_trust, &b.fingerprint(), &code)
+            .await
+            .is_err());
+        assert!(b_trust.get(&c.fingerprint()).is_none());
+    }
+
+    #[tokio::test]
+    async fn wrong_code_or_other_messages_get_nothing() {
+        let (a, a_trust) = node("a");
+        let (b, b_trust) = node("b");
+        let s = start(b.clone(), b_trust.clone(), temp_dir("dest")).await;
+        let code = s.pairing.open().unwrap();
+
+        let wrong = "0".repeat(32);
+        assert!(pair(s.addr, &a, a_trust.clone(), &b.fingerprint(), &wrong)
+            .await
+            .is_err());
+        assert!(b_trust.get(&a.fingerprint()).is_none());
+
+        // An unknown device inside the window may not PING (or send files) instead of pairing.
+        let config = security::client_config(&a, a_trust.clone(), Some(b.fingerprint())).unwrap();
+        let (mut tls, _) = open(s.addr, &a, config).await.unwrap();
+        protocol::write(&mut tls, &Message::Ping { nonce: 1 })
+            .await
+            .unwrap();
+        assert!(protocol::read(&mut tls).await.is_err());
+
+        // 1 wrong attempt so far (the PING session does not count); 2 more close the window.
+        assert!(pair(s.addr, &a, a_trust.clone(), &b.fingerprint(), &wrong)
+            .await
+            .is_err());
+        assert!(pair(s.addr, &a, a_trust.clone(), &b.fingerprint(), &wrong)
+            .await
+            .is_err());
+        assert!(pair(s.addr, &a, a_trust, &b.fingerprint(), &code)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn closed_window_rejects_unknown_devices_at_handshake() {
+        let (a, a_trust) = node("a");
+        let (b, b_trust) = node("b");
+        let s = start(b.clone(), b_trust, temp_dir("dest")).await;
+        let code = s.pairing.open().unwrap();
+        s.pairing.close();
+        assert!(pair(s.addr, &a, a_trust, &b.fingerprint(), &code)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn re_pairing_keeps_the_label_the_user_chose() {
+        let (a, a_trust) = node("a");
+        let (b, b_trust) = node("b");
+        a_trust.add(&b.fingerprint(), "b").unwrap();
+        b_trust.add(&a.fingerprint(), "Mom's phone").unwrap();
+        let s = start(b.clone(), b_trust.clone(), temp_dir("dest")).await;
+        let code = s.pairing.open().unwrap();
+
+        pair(s.addr, &a, a_trust, &b.fingerprint(), &code)
+            .await
+            .unwrap();
+        assert_eq!(b_trust.get(&a.fingerprint()).unwrap().name, "Mom's phone");
     }
 }

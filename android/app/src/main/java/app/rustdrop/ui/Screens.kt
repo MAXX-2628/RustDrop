@@ -4,6 +4,7 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
+import androidx.compose.foundation.Canvas
 import androidx.compose.animation.slideInVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
@@ -12,6 +13,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
@@ -47,14 +49,19 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -72,6 +79,7 @@ import app.rustdrop.Core
 import app.rustdrop.Transfer
 import app.rustdrop.core.IncomingRequest
 import app.rustdrop.core.Me
+import app.rustdrop.core.PairingOffer
 import app.rustdrop.core.PeerInfo
 import app.rustdrop.core.TransferState
 import app.rustdrop.core.TrustedInfo
@@ -87,6 +95,8 @@ import com.composables.icons.lucide.House
 import com.composables.icons.lucide.Image
 import com.composables.icons.lucide.Lucide
 import com.composables.icons.lucide.Monitor
+import com.composables.icons.lucide.QrCode
+import com.composables.icons.lucide.ScanLine
 import com.composables.icons.lucide.RefreshCw
 import com.composables.icons.lucide.Send
 import com.composables.icons.lucide.Settings
@@ -111,6 +121,9 @@ class Actions(
     val unpair: (String) -> Unit,
     val copy: (String) -> Unit,
     val openDownloads: () -> Unit,
+    val scanQr: () -> Unit,
+    val showQr: () -> Unit,
+    val hideQr: () -> Unit,
 )
 
 private enum class Tab(val label: String, val icon: ImageVector) {
@@ -167,7 +180,7 @@ fun RustDropUi(actions: Actions) {
                     onSeeAll = { tab = Tab.Activity },
                 )
                 Tab.Activity -> ActivityScreen(transfers, actions)
-                Tab.Settings -> me?.let { SettingsScreen(it, trusted, peers, pairName, { pairName = it }, actions) }
+                Tab.Settings -> me?.let { SettingsScreen(it, trusted, peers, pairName, { pairName = it }, actions) { QrPairing(actions) } }
             }
         }
     }
@@ -492,6 +505,7 @@ private fun SettingsScreen(
     pairName: String,
     setPairName: (String) -> Unit,
     actions: Actions,
+    qrPairing: @Composable () -> Unit,
 ) {
     val sp = LocalSpacing.current
     val palette = LocalPalette.current
@@ -510,6 +524,8 @@ private fun SettingsScreen(
     LazyColumn(contentPadding = PaddingValues(sp.xl), verticalArrangement = Arrangement.spacedBy(sp.xl)) {
         item { Text("Settings", style = MaterialTheme.typography.headlineMedium, modifier = Modifier.semantics { heading() }) }
 
+        item { qrPairing() }
+
         item {
             Panel("Your fingerprint") {
                 Text("Compare it with what the other device shows before you pair.", style = MaterialTheme.typography.bodySmall, color = palette.textSecondary)
@@ -523,9 +539,9 @@ private fun SettingsScreen(
         }
 
         item {
-            Panel("Pair a device") {
+            Panel("Pair with a fingerprint") {
                 Text(
-                    "Paired devices can ask to send you files. You still accept each transfer. Pair on both devices, using each other's fingerprint.",
+                    "If scanning isn't possible, enter each other's fingerprint on both devices.",
                     style = MaterialTheme.typography.bodySmall,
                     color = palette.textSecondary,
                 )
@@ -628,8 +644,85 @@ private fun SettingsScreen(
     }
 }
 
+private const val PAIRING_SECONDS = 120 // matches the core's PAIRING_TTL
+
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun Panel(title: String, content: @Composable () -> Unit) {
+private fun QrPairing(actions: Actions) {
+    val sp = LocalSpacing.current
+    val palette = LocalPalette.current
+    val offer by Core.pairingOffer.collectAsStateWithLifecycle()
+    val message by Core.pairingMessage.collectAsStateWithLifecycle()
+    // Leaving Settings closes an open pairing window.
+    DisposableEffect(Unit) { onDispose { actions.hideQr() } }
+
+    Panel("Pair with a QR code") {
+        val shown = offer
+        if (shown == null) {
+            Text(
+                "Scan the code another RustDrop device shows, or show yours. Both devices are paired in one step. They need to be on the same network.",
+                style = MaterialTheme.typography.bodySmall,
+                color = palette.textSecondary,
+            )
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(sp.md), verticalArrangement = Arrangement.spacedBy(sp.sm)) {
+                Button(onClick = actions.scanQr, modifier = Modifier.heightIn(min = 48.dp)) {
+                    Icon(Lucide.ScanLine, contentDescription = null, Modifier.size(18.dp))
+                    Spacer(Modifier.width(sp.sm))
+                    Text("Scan QR code")
+                }
+                OutlinedButton(onClick = actions.showQr, modifier = Modifier.heightIn(min = 48.dp)) {
+                    Icon(Lucide.QrCode, contentDescription = null, Modifier.size(18.dp))
+                    Spacer(Modifier.width(sp.sm))
+                    Text("Show my code")
+                }
+            }
+        } else {
+            var secondsLeft by remember(shown) { mutableIntStateOf(PAIRING_SECONDS) }
+            LaunchedEffect(shown) {
+                while (secondsLeft > 0) {
+                    delay(1000)
+                    secondsLeft--
+                }
+                actions.hideQr()
+            }
+            QrImage(shown, Modifier.align(Alignment.CenterHorizontally))
+            Text("On the other device, open RustDrop and scan this code.")
+            Text(
+                "The code works once and expires in ${secondsLeft / 60}:${(secondsLeft % 60).toString().padStart(2, '0')}.",
+                style = MaterialTheme.typography.bodySmall,
+                color = palette.textSecondary,
+            )
+            TextButton(onClick = actions.hideQr) { Text("Cancel") }
+        }
+        message?.let { text ->
+            val ok = text.startsWith("Paired with")
+            StatusLine(if (ok) Lucide.CircleCheck else Lucide.CircleAlert, text, if (ok) palette.success else palette.error)
+        }
+    }
+}
+
+/** Black on white whatever the theme: scanners need maximum contrast and a light quiet zone. */
+@Composable
+private fun QrImage(offer: PairingOffer, modifier: Modifier = Modifier) {
+    val n = offer.size.toInt()
+    val quiet = 4
+    Canvas(modifier.size(240.dp).semantics { contentDescription = "Pairing QR code" }) {
+        drawRect(Color.White)
+        val cell = size.minDimension / (n + quiet * 2)
+        offer.modules.forEachIndexed { i, dark ->
+            if (dark) {
+                drawRect(
+                    Color.Black,
+                    topLeft = Offset((i % n + quiet) * cell, (i / n + quiet) * cell),
+                    size = Size(cell + 0.5f, cell + 0.5f), // overlap by half a pixel so no seams show
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun Panel(title: String, content: @Composable ColumnScope.() -> Unit) {
     val sp = LocalSpacing.current
     Column(
         Modifier.fillMaxWidth()

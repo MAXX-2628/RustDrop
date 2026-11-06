@@ -18,6 +18,7 @@ import {
   Settings,
   Shield,
   ShieldCheck,
+  QrCode as QrIcon,
   Smartphone,
   X,
   type LucideIcon,
@@ -28,6 +29,7 @@ import {
   api,
   events,
   type IncomingRequest,
+  type PairingOffer,
   type Me,
   type Peer,
   type Transfer,
@@ -63,6 +65,7 @@ export function App() {
   const [dragging, setDragging] = useState(false);
   const [dropTarget, setDropTarget] = useState<string | null>(null);
   const [pairName, setPairName] = useState("");
+  const [lastPaired, setLastPaired] = useState<{ name: string; at: number } | null>(null);
 
   const peersRef = useRef(peers);
   peersRef.current = peers;
@@ -110,6 +113,10 @@ export function App() {
       events.peers(setPeers),
       events.transfer(merge),
       events.fatal(setFatal),
+      events.paired((name) => {
+        setLastPaired({ name, at: Date.now() });
+        reloadTrusted();
+      }),
       events.incoming((r) => {
         setRequests((q) => [...q, r]);
         // The core declines unanswered requests after a minute; drop the dialog at the same time.
@@ -275,6 +282,8 @@ export function App() {
               pairName={pairName}
               setPairName={setPairName}
               onChanged={reloadTrusted}
+              lastPaired={lastPaired}
+              onPairedShown={() => setLastPaired(null)}
             />
           )}
           {view === "settings" && me && <SettingsView me={me} />}
@@ -607,6 +616,9 @@ function TrustedView(props: {
   pairName: string;
   setPairName: (name: string) => void;
   onChanged: () => void;
+  lastPaired: { name: string; at: number } | null;
+  /** Called once the notice is shown, so it does not reappear when this screen opens again. */
+  onPairedShown: () => void;
 }) {
   const [fingerprint, setFingerprint] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -639,15 +651,95 @@ function TrustedView(props: {
     props.onChanged();
   };
 
+  const [offer, setOffer] = useState<PairingOffer | null>(null);
+  const [secondsLeft, setSecondsLeft] = useState(0);
+  const [qrError, setQrError] = useState<string | null>(null);
+  const [pairedName, setPairedName] = useState<string | null>(null);
+
+  const showQr = async () => {
+    try {
+      setOffer(await api.startPairing());
+      setSecondsLeft(PAIRING_SECONDS);
+      setQrError(null);
+      setPairedName(null);
+    } catch (e) {
+      setQrError(String(e));
+    }
+  };
+  const hideQr = () => {
+    setOffer(null);
+    api.stopPairing();
+  };
+
+  useEffect(() => {
+    if (!offer) return;
+    if (secondsLeft <= 0) return hideQr();
+    const t = setTimeout(() => setSecondsLeft((s) => s - 1), 1000);
+    return () => clearTimeout(t);
+  }, [offer, secondsLeft]);
+
+  // The other device scanned the code: close it and say who paired.
+  useEffect(() => {
+    if (!props.lastPaired) return;
+    setOffer(null);
+    setPairedName(props.lastPaired.name);
+    props.onPairedShown();
+  }, [props.lastPaired]);
+
+  // Leaving this screen closes an open pairing window.
+  useEffect(() => () => void api.stopPairing(), []);
+
   return (
     <>
       <header className="page-head">
         <h1>Trusted devices</h1>
         <p className="lede">
-          Paired devices can ask to send you files. You still accept each transfer. Pair on both devices, using each
-          other's fingerprint.
+          Paired devices can ask to send you files. You still accept each transfer.
         </p>
       </header>
+
+      <section className="panel" aria-labelledby="qr-title">
+        <h2 id="qr-title">Pair with a QR code</h2>
+        {offer ? (
+          <div className="qr">
+            <QrImage offer={offer} />
+            <div className="qr-text">
+              <p>
+                On the other device, open RustDrop, go to Settings and tap <strong>Scan QR code</strong>. Both devices
+                will be paired.
+              </p>
+              <p className="caption" aria-live="polite">
+                The code works once and expires in {Math.floor(secondsLeft / 60)}:
+                {String(secondsLeft % 60).padStart(2, "0")}.
+              </p>
+              <button className="btn tertiary" onClick={hideQr}>
+                <X size={16} aria-hidden />
+                Cancel
+              </button>
+            </div>
+          </div>
+        ) : (
+          <>
+            <p className="caption">Show a code for your phone to scan. Both devices need to be on the same network.</p>
+            <button className="btn primary" onClick={showQr}>
+              <QrIcon size={18} aria-hidden />
+              Show QR code
+            </button>
+          </>
+        )}
+        {pairedName && (
+          <p className="notice info" role="status">
+            <CircleCheck size={16} aria-hidden />
+            Paired with {pairedName}.
+          </p>
+        )}
+        {qrError && (
+          <p className="notice error" role="alert">
+            <CircleAlert size={16} aria-hidden />
+            {qrError}
+          </p>
+        )}
+      </section>
 
       <section className="panel" aria-labelledby="fp-title">
         <h2 id="fp-title">Your fingerprint</h2>
@@ -662,7 +754,8 @@ function TrustedView(props: {
       </section>
 
       <section className="panel" aria-labelledby="pair-title">
-        <h2 id="pair-title">Pair a device</h2>
+        <h2 id="pair-title">Pair with a fingerprint</h2>
+        <p className="caption">If scanning isn't possible, enter each other's fingerprint on both devices.</p>
         {unpaired.length > 0 && (
           <div className="chips">
             <span className="caption">Nearby, not paired:</span>
@@ -746,6 +839,30 @@ function TrustedView(props: {
         )}
       </section>
     </>
+  );
+}
+
+const PAIRING_SECONDS = 120; // matches the core's PAIRING_TTL
+
+/** Black on white whatever the theme: scanners need maximum contrast and a light quiet zone. */
+function QrImage({ offer }: { offer: PairingOffer }) {
+  const quiet = 4;
+  const n = offer.size;
+  const path = offer.modules
+    .map((dark, i) => (dark ? `M${(i % n) + quiet} ${Math.floor(i / n) + quiet}h1v1h-1z` : ""))
+    .join("");
+  const side = n + quiet * 2;
+  return (
+    <svg
+      className="qr-image"
+      viewBox={`0 0 ${side} ${side}`}
+      shapeRendering="crispEdges"
+      role="img"
+      aria-label="Pairing QR code"
+    >
+      <rect width={side} height={side} fill="#FFFFFF" />
+      <path d={path} fill="#000000" />
+    </svg>
   );
 }
 

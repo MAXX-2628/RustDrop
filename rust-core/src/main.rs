@@ -67,6 +67,7 @@ async fn run(identity: Arc<Identity>, trust: Arc<TrustStore>) -> Result<()> {
         identity.clone(),
         trust.clone(),
         inbox,
+        Default::default(), // the CLI never opens a QR pairing window
     ));
     tokio::spawn(show_events(events));
 
@@ -143,6 +144,7 @@ async fn show_events(mut events: mpsc::Receiver<Event>) {
                 }
             }
             Event::Failed { reason, .. } => println!("\ntransfer failed: {reason}"),
+            Event::Paired { name } => println!("\npaired with {name}"),
         }
     }
 }

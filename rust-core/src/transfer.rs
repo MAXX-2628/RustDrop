@@ -70,6 +70,10 @@ pub enum Event {
         transfer_id: Uuid,
         reason: String,
     },
+    /// A device completed QR pairing with this one; `name` is its new trust-store label.
+    Paired {
+        name: String,
+    },
 }
 
 /// Receiver state shared by all sessions.
@@ -86,6 +90,10 @@ impl Inbox {
             events,
             used_ids: Mutex::new(HashSet::new()),
         }
+    }
+
+    pub(crate) async fn notify(&self, event: Event) {
+        let _ = self.events.send(event).await;
     }
 }
 
@@ -550,7 +558,8 @@ mod tests {
     async fn sends_file_and_folder_without_overwriting() {
         let ((a, a_trust), (b, b_trust)) = trusted_pair();
         let dest = temp_dir("dest");
-        let (addr, events) = start(b, b_trust, dest.clone()).await;
+        let s = start(b, b_trust, dest.clone()).await;
+        let (addr, events) = (s.addr, s.events);
         auto_answer(events, true);
 
         let src = temp_dir("src");
@@ -575,7 +584,8 @@ mod tests {
     async fn declined_transfer_writes_nothing() {
         let ((a, a_trust), (b, b_trust)) = trusted_pair();
         let dest = temp_dir("dest");
-        let (addr, events) = start(b, b_trust, dest.clone()).await;
+        let s = start(b, b_trust, dest.clone()).await;
+        let (addr, events) = (s.addr, s.events);
         auto_answer(events, false);
 
         let src = temp_dir("src");

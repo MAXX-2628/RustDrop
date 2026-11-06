@@ -5,15 +5,18 @@
 use std::{
     collections::HashMap,
     fmt,
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     ops::ControlFlow,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use serde::Serialize;
 use tokio::{
-    runtime::{Handle, Runtime},
+    runtime::{Builder, Handle, Runtime},
     sync::{mpsc, oneshot},
     task::JoinHandle,
 };
@@ -22,7 +25,7 @@ use uuid::Uuid;
 use crate::{
     discovery,
     identity::Identity,
-    security::TrustStore,
+    security::{PairingWindow, TrustStore},
     server,
     transfer::{self, Event, Inbox, Outcome, TransferState},
     VERSION,
@@ -95,6 +98,15 @@ pub struct TransferUpdate {
     pub saved: Option<Vec<String>>,
 }
 
+/// A QR pairing code to show: `modules` holds `size` x `size` cells, row by row, true = dark.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct PairingOffer {
+    pub link: String,
+    pub size: u32,
+    pub modules: Vec<bool>,
+}
+
 #[derive(Debug)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Error), uniffi(flat_error))]
 pub enum NodeError {
@@ -122,8 +134,15 @@ pub trait Listener: Send + Sync {
     fn peers_changed(&self, peers: Vec<PeerInfo>);
     fn incoming(&self, request: IncomingRequest);
     fn transfer_changed(&self, update: TransferUpdate);
+    /// A device finished QR pairing with this one (it scanned this device's code).
+    fn paired(&self, name: String);
     /// The node stopped working (for example, it could not open a network socket).
     fn failed(&self, message: String);
+}
+
+struct Discovery {
+    daemon: mdns_sd::ServiceDaemon,
+    task: JoinHandle<()>,
 }
 
 struct Peer {
@@ -141,6 +160,11 @@ struct Inner {
     pending: Mutex<HashMap<Uuid, oneshot::Sender<bool>>>,
     sends: Mutex<HashMap<Uuid, JoinHandle<()>>>,
     error: Mutex<Option<String>>,
+    pairing: Arc<PairingWindow>,
+    port: Mutex<Option<u16>>,
+    /// Wanted state; the UI turns discovery off when nobody is looking (saves battery).
+    discover: AtomicBool,
+    discovery: Mutex<Option<Discovery>>,
 }
 
 #[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
@@ -201,7 +225,13 @@ impl Node {
             .map_err(|e| fail(format!("Couldn't load this device's identity: {e:#}")))?;
         let trust = TrustStore::load(data_dir.join("trusted.json"))
             .map_err(|e| fail(format!("Couldn't load trusted devices: {e:#}")))?;
-        let runtime = Runtime::new().map_err(|e| fail(e.to_string()))?;
+        // Two workers are plenty for a LAN app; one per core would only add idle threads.
+        let runtime = Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("rustdrop")
+            .enable_all()
+            .build()
+            .map_err(|e| fail(e.to_string()))?;
         let inner = Arc::new(Inner {
             identity: Arc::new(identity),
             trust: Arc::new(trust),
@@ -212,6 +242,10 @@ impl Node {
             pending: Mutex::default(),
             sends: Mutex::default(),
             error: Mutex::default(),
+            pairing: Arc::default(),
+            port: Mutex::default(),
+            discover: AtomicBool::new(true),
+            discovery: Mutex::default(),
         });
         let node = inner.clone();
         runtime.spawn(async move {
@@ -359,9 +393,167 @@ impl Node {
             self.inner.listener.transfer_changed(update);
         }
     }
+
+    /// Turns mDNS announce/browse on or off. Receiving stays on; paired devices that already
+    /// know this device can still reach it. Mobile UIs turn this off in the background to save battery.
+    pub fn set_discovery(&self, enabled: bool) {
+        self.inner.discover.store(enabled, Ordering::SeqCst);
+        if enabled {
+            self.inner.start_discovery();
+        } else {
+            self.inner.stop_discovery();
+        }
+    }
+
+    /// Opens a 2-minute QR pairing window. Show `link` as a QR code (from `size` x `size` `modules`,
+    /// row by row, true = dark) for the other device to scan.
+    pub fn start_pairing(&self) -> Result<PairingOffer, NodeError> {
+        let port = (*self.inner.port.lock().unwrap())
+            .ok_or_else(|| fail("RustDrop isn't ready to pair yet. Try again in a moment."))?;
+        let addrs = local_addrs(port);
+        if addrs.is_empty() {
+            return Err(fail("Connect to a Wi-Fi or wired network to pair."));
+        }
+        let code = self.inner.pairing.open().map_err(|e| fail(e.to_string()))?;
+        let mut link = format!(
+            "rustdrop://pair?v=1&fp={}&code={code}",
+            self.inner.identity.fingerprint()
+        );
+        for addr in addrs {
+            link.push_str(&format!("&addr={addr}"));
+        }
+        let qr = qrcode::QrCode::new(link.as_bytes()).map_err(|e| fail(e.to_string()))?;
+        Ok(PairingOffer {
+            size: qr.width() as u32,
+            modules: qr
+                .to_colors()
+                .into_iter()
+                .map(|c| c == qrcode::Color::Dark)
+                .collect(),
+            link,
+        })
+    }
+
+    pub fn stop_pairing(&self) {
+        self.inner.pairing.close();
+    }
+
+    /// Pairs using a scanned QR link and returns the other device's name. Both devices end up
+    /// trusting each other. Blocks for up to a few seconds per address; call it off the UI thread
+    /// and never from inside an async runtime.
+    pub fn pair_with_link(&self, link: String) -> Result<String, NodeError> {
+        let link = parse_link(&link).ok_or_else(|| fail("That isn't a RustDrop pairing code."))?;
+        if link.fp == self.inner.identity.fingerprint() {
+            return Err(fail("That's this device's own pairing code."));
+        }
+        let node = self.inner.clone();
+        let result = self.inner.rt.block_on(async move {
+            let mut last = None;
+            for addr in &link.addrs {
+                match server::pair(
+                    *addr,
+                    &node.identity,
+                    node.trust.clone(),
+                    &link.fp,
+                    &link.code,
+                )
+                .await
+                {
+                    Ok(peer) => return Ok(peer),
+                    Err(e) => last = Some(e),
+                }
+            }
+            Err(last.expect("parse_link guarantees at least one address"))
+        });
+        match result {
+            Ok(peer) => {
+                self.inner.recheck_all();
+                Ok(peer.name)
+            }
+            Err(e) if format!("{e:#}").contains("certificate") => Err(fail(
+                "Couldn't verify the other device. Show a new QR code on it and scan again.",
+            )),
+            Err(e) => Err(fail(friendly(&e))),
+        }
+    }
 }
 
 impl Inner {
+    fn start_discovery(self: &Arc<Self>) {
+        let Some(port) = *self.port.lock().unwrap() else {
+            return; // run() starts discovery once the listener is bound
+        };
+        let mut slot = self.discovery.lock().unwrap();
+        if slot.is_some() {
+            return;
+        }
+        let daemon = match mdns_sd::ServiceDaemon::new() {
+            Ok(d) => d,
+            Err(e) => {
+                return self
+                    .listener
+                    .failed(format!("Couldn't start device discovery: {e}"))
+            }
+        };
+        if let Err(e) = discovery::advertise(&daemon, &self.identity.info(), port) {
+            let _ = daemon.shutdown();
+            return self
+                .listener
+                .failed(format!("Couldn't announce this device: {e:#}"));
+        }
+        let (node, browsing) = (self.clone(), daemon.clone());
+        let task = self.rt.spawn(async move {
+            let _ = discovery::browse(&browsing, node.identity.id, |peer| node.on_peer(peer)).await;
+        });
+        *slot = Some(Discovery { daemon, task });
+    }
+
+    /// Stops announcing and browsing; the nearby list empties until discovery resumes.
+    fn stop_discovery(&self) {
+        if let Some(d) = self.discovery.lock().unwrap().take() {
+            d.task.abort();
+            // Goodbye packet first, so other devices drop us; the daemon runs commands in order.
+            let _ = d
+                .daemon
+                .unregister(&format!("{}.{}", self.identity.id, discovery::SERVICE));
+            let _ = d.daemon.shutdown();
+        }
+        self.peers.lock().unwrap().clear();
+        self.emit_peers();
+    }
+
+    // shortcut: devices that leave the network stay listed while discovery runs; handle ServiceRemoved for "Unavailable".
+    fn on_peer(self: &Arc<Self>, peer: discovery::Peer) -> ControlFlow<()> {
+        let Some(addr) = peer.addrs.iter().copied().find(|a| a.is_ipv4()) else {
+            return ControlFlow::Continue(());
+        };
+        let id = peer.info.device_id;
+        let changed = {
+            let mut peers = self.peers.lock().unwrap();
+            match peers.get_mut(&id) {
+                Some(p) if p.addr == addr => false,
+                Some(p) => {
+                    p.addr = addr;
+                    true
+                }
+                None => {
+                    let info = PeerInfo {
+                        id: id.to_string(),
+                        name: peer.info.name,
+                        platform: peer.info.platform,
+                        trusted: None,
+                    };
+                    peers.insert(id, Peer { info, addr });
+                    true
+                }
+            }
+        };
+        if changed {
+            self.check(id);
+        }
+        ControlFlow::Continue(())
+    }
+
     fn peer_list(&self) -> Vec<PeerInfo> {
         let peers = self.peers.lock().unwrap();
         let mut list: Vec<PeerInfo> = peers.values().map(|p| p.info.clone()).collect();
@@ -400,7 +592,7 @@ impl Inner {
         }
     }
 
-    fn forward(&self, event: Event) {
+    fn forward(self: &Arc<Self>, event: Event) {
         let update = match event {
             Event::Incoming(req) => {
                 let id = req.transfer_id;
@@ -447,6 +639,11 @@ impl Inner {
                 transfer_id,
                 reason,
             } => state(transfer_id, TransferState::Failed, Some(&reason)),
+            Event::Paired { name } => {
+                self.listener.paired(name);
+                self.recheck_all();
+                return;
+            }
         };
         self.listener.transfer_changed(update);
     }
@@ -455,7 +652,7 @@ impl Inner {
 async fn run(node: Arc<Inner>) -> anyhow::Result<()> {
     // shortcut: IPv4 only; add an IPv6 listener for IPv6-only networks.
     let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
-    let port = listener.local_addr()?.port();
+    *node.port.lock().unwrap() = Some(listener.local_addr()?.port());
     let (tx, mut events) = mpsc::channel(32);
     let inbox = Arc::new(Inbox::new(node.downloads.clone(), tx));
     tokio::spawn(server::listen(
@@ -463,6 +660,7 @@ async fn run(node: Arc<Inner>) -> anyhow::Result<()> {
         node.identity.clone(),
         node.trust.clone(),
         inbox,
+        node.pairing.clone(),
     ));
     let forwarder = node.clone();
     tokio::spawn(async move {
@@ -470,41 +668,64 @@ async fn run(node: Arc<Inner>) -> anyhow::Result<()> {
             forwarder.forward(event);
         }
     });
+    if node.discover.load(Ordering::SeqCst) {
+        node.start_discovery();
+    }
+    Ok(())
+}
 
-    let daemon = mdns_sd::ServiceDaemon::new()?;
-    discovery::advertise(&daemon, &node.identity.info(), port)?;
-    // shortcut: devices that leave the network stay listed until restart; handle ServiceRemoved for "Unavailable".
-    discovery::browse(&daemon, node.identity.id, |peer| {
-        let Some(addr) = peer.addrs.iter().copied().find(|a| a.is_ipv4()) else {
-            return ControlFlow::Continue(());
-        };
-        let id = peer.info.device_id;
-        let changed = {
-            let mut peers = node.peers.lock().unwrap();
-            match peers.get_mut(&id) {
-                Some(p) if p.addr == addr => false,
-                Some(p) => {
-                    p.addr = addr;
-                    true
-                }
-                None => {
-                    let info = PeerInfo {
-                        id: id.to_string(),
-                        name: peer.info.name,
-                        platform: peer.info.platform,
-                        trusted: None,
-                    };
-                    peers.insert(id, Peer { info, addr });
-                    true
-                }
-            }
-        };
-        if changed {
-            node.check(id);
+/// This device's reachable IPv4 addresses (private LAN ranges first) for the pairing QR code.
+fn local_addrs(port: u16) -> Vec<SocketAddr> {
+    let mut ips: Vec<Ipv4Addr> = if_addrs::get_if_addrs()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|i| match i.ip() {
+            IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_link_local() => Some(ip),
+            _ => None,
+        })
+        .collect();
+    ips.sort_by_key(|ip| !ip.is_private());
+    ips.dedup();
+    ips.into_iter()
+        .take(4)
+        .map(|ip| SocketAddr::new(IpAddr::V4(ip), port))
+        .collect()
+}
+
+#[derive(Debug, PartialEq)]
+struct PairLink {
+    fp: String,
+    code: String,
+    addrs: Vec<SocketAddr>,
+}
+
+fn is_hex(s: &str, len: usize) -> bool {
+    s.len() == len
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Parses `rustdrop://pair?v=1&fp=<64 hex>&code=<32 hex>&addr=<ip:port>...`, which came from a camera: untrusted.
+fn parse_link(link: &str) -> Option<PairLink> {
+    let query = link.trim().strip_prefix("rustdrop://pair?")?;
+    let (mut version, mut fp, mut code, mut addrs) = (None, None, None, Vec::new());
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=')?;
+        match key {
+            "v" => version = Some(value),
+            "fp" => fp = Some(value),
+            "code" => code = Some(value),
+            "addr" if addrs.len() < 8 => addrs.push(value.parse().ok()?),
+            _ => {}
         }
-        ControlFlow::Continue(())
+    }
+    let (fp, code) = (fp?, code?);
+    let valid = version == Some("1") && is_hex(fp, 64) && is_hex(code, 32) && !addrs.is_empty();
+    valid.then(|| PairLink {
+        fp: fp.into(),
+        code: code.into(),
+        addrs,
     })
-    .await
 }
 
 #[cfg(test)]
@@ -513,7 +734,7 @@ mod tests {
     use crate::server::tests::temp_dir;
 
     #[derive(Default)]
-    struct Recorder(Mutex<Vec<TransferUpdate>>);
+    struct Recorder(Mutex<Vec<TransferUpdate>>, Mutex<Vec<String>>);
 
     impl Listener for Recorder {
         fn peers_changed(&self, _: Vec<PeerInfo>) {}
@@ -521,20 +742,82 @@ mod tests {
         fn transfer_changed(&self, update: TransferUpdate) {
             self.0.lock().unwrap().push(update);
         }
+        fn paired(&self, name: String) {
+            self.1.lock().unwrap().push(name);
+        }
         fn failed(&self, _: String) {}
+    }
+
+    fn new_node(name: &str, recorder: Arc<Recorder>) -> Arc<Node> {
+        let dir = temp_dir("node");
+        Node::new(
+            dir.join("data").display().to_string(),
+            dir.join("dl").display().to_string(),
+            Some(name.into()),
+            recorder,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn parses_only_well_formed_pairing_links() {
+        let (fp, code) = ("ab".repeat(32), "0f".repeat(16));
+        let ok = format!(
+            "rustdrop://pair?v=1&fp={fp}&code={code}&addr=192.168.1.5:4000&addr=10.0.0.2:4000"
+        );
+        let link = parse_link(&ok).unwrap();
+        assert_eq!(link.addrs.len(), 2);
+        assert_eq!(link.fp, fp);
+        for bad in [
+            format!("https://pair?v=1&fp={fp}&code={code}&addr=1.2.3.4:5"),
+            format!("rustdrop://pair?v=2&fp={fp}&code={code}&addr=1.2.3.4:5"),
+            format!(
+                "rustdrop://pair?v=1&fp={}&code={code}&addr=1.2.3.4:5",
+                "AB".repeat(32)
+            ),
+            format!("rustdrop://pair?v=1&fp={fp}&code=short&addr=1.2.3.4:5"),
+            format!("rustdrop://pair?v=1&fp={fp}&code={code}"),
+            format!("rustdrop://pair?v=1&fp={fp}&code={code}&addr=not-an-address"),
+            format!("rustdrop://pair?v=1&fp={fp}&code={code}&addr"),
+        ] {
+            assert!(parse_link(&bad).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn qr_pairing_between_two_nodes() {
+        let (ra, rb) = (Arc::new(Recorder::default()), Arc::new(Recorder::default()));
+        let (a, b) = (new_node("Phone", ra), new_node("Laptop", rb.clone()));
+        a.set_discovery(false);
+        b.set_discovery(false);
+
+        // The listener binds in the background; pairing is refused until it is ready.
+        let offer = (0..100)
+            .find_map(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                b.start_pairing().ok()
+            })
+            .expect("listener never became ready");
+        assert_eq!(offer.modules.len(), (offer.size * offer.size) as usize);
+        assert!(a.pair_with_link(b.me().id).is_err());
+
+        assert_eq!(a.pair_with_link(offer.link.clone()).unwrap(), "Laptop");
+        assert_eq!(a.trusted()[0].fingerprint, b.me().fingerprint);
+        assert_eq!(b.trusted()[0].fingerprint, a.me().fingerprint);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(*rb.1.lock().unwrap(), vec!["Phone".to_string()]);
+
+        // Single use: the same QR code does not work twice.
+        let c = new_node("Stranger", Arc::new(Recorder::default()));
+        c.set_discovery(false);
+        assert!(c.pair_with_link(offer.link).is_err());
+        assert_eq!(b.trusted().len(), 1);
     }
 
     #[test]
     fn rejects_bad_input_and_reports_expired_requests() {
-        let dir = temp_dir("node");
         let recorder = Arc::new(Recorder::default());
-        let node = Node::new(
-            dir.join("data").display().to_string(),
-            dir.join("dl").display().to_string(),
-            Some("Pixel".into()),
-            recorder.clone(),
-        )
-        .unwrap();
+        let node = new_node("Pixel", recorder.clone());
 
         assert_eq!(node.me().name, "Pixel");
         assert!(node.pair("not-hex".into(), "x".into()).is_err());

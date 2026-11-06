@@ -22,3 +22,5 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "crypt
 ring = "0.17"
 mdns-sd = "0.13"
 uniffi = "=0.32.2"
+if-addrs = "0.13"
+qrcode = { version = "0.14", default-features = false }

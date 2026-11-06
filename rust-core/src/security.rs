@@ -1,12 +1,14 @@
 //! TLS 1.3 with mutual certificate pinning: a peer is accepted only if its
 //! certificate fingerprint is in the local trust store. There is no CA; the
-//! handshake signature is still fully verified by rustls.
+//! handshake signature is still fully verified by rustls. QR pairing (`PairingWindow`) is the
+//! only way an unknown device gets past the handshake, and only to present a one-time code.
 
 use std::{
     collections::HashMap,
     fs,
     path::PathBuf,
-    sync::{Arc, RwLock},
+    sync::{Arc, Mutex, RwLock},
+    time::{Duration, Instant},
 };
 
 use anyhow::Result;
@@ -94,15 +96,24 @@ impl TrustStore {
 struct PinnedVerifier {
     trust: Arc<TrustStore>,
     provider: Arc<CryptoProvider>,
+    /// Client side of QR pairing: the server fingerprint read from the QR code.
+    pin: Option<String>,
+    /// Server side of QR pairing: unknown clients may connect while a window is open.
+    pairing: Option<Arc<PairingWindow>>,
 }
 
 impl PinnedVerifier {
     fn check(&self, cert: &CertificateDer<'_>) -> Result<(), Error> {
-        match self.trust.get(&fingerprint(cert)) {
-            Some(_) => Ok(()),
-            None => Err(Error::InvalidCertificate(
+        let fp = fingerprint(cert);
+        let ok = self.trust.get(&fp).is_some()
+            || self.pin.as_deref() == Some(fp.as_str())
+            || self.pairing.as_ref().is_some_and(|w| w.is_open());
+        if ok {
+            Ok(())
+        } else {
+            Err(Error::InvalidCertificate(
                 CertificateError::ApplicationVerificationFailure,
-            )),
+            ))
         }
     }
 
@@ -205,17 +216,27 @@ impl ClientCertVerifier for PinnedVerifier {
     }
 }
 
-fn verifier(trust: Arc<TrustStore>) -> (Arc<CryptoProvider>, Arc<PinnedVerifier>) {
+fn verifier(
+    trust: Arc<TrustStore>,
+    pin: Option<String>,
+    pairing: Option<Arc<PairingWindow>>,
+) -> (Arc<CryptoProvider>, Arc<PinnedVerifier>) {
     let provider = Arc::new(ring::default_provider());
     let verifier = Arc::new(PinnedVerifier {
         trust,
         provider: provider.clone(),
+        pin,
+        pairing,
     });
     (provider, verifier)
 }
 
-pub fn server_config(id: &Identity, trust: Arc<TrustStore>) -> Result<Arc<ServerConfig>> {
-    let (provider, verifier) = verifier(trust);
+pub fn server_config(
+    id: &Identity,
+    trust: Arc<TrustStore>,
+    pairing: Arc<PairingWindow>,
+) -> Result<Arc<ServerConfig>> {
+    let (provider, verifier) = verifier(trust, None, Some(pairing));
     let cfg = ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .with_client_cert_verifier(verifier)
@@ -223,12 +244,81 @@ pub fn server_config(id: &Identity, trust: Arc<TrustStore>) -> Result<Arc<Server
     Ok(Arc::new(cfg))
 }
 
-pub fn client_config(id: &Identity, trust: Arc<TrustStore>) -> Result<Arc<ClientConfig>> {
-    let (provider, verifier) = verifier(trust);
+/// Client config; `pin` additionally accepts one not-yet-trusted server fingerprint (QR pairing).
+pub fn client_config(
+    id: &Identity,
+    trust: Arc<TrustStore>,
+    pin: Option<String>,
+) -> Result<Arc<ClientConfig>> {
+    let (provider, verifier) = verifier(trust, pin, None);
     let cfg = ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])?
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_client_auth_cert(vec![id.cert.clone()], id.key.clone_key())?;
     Ok(Arc::new(cfg))
+}
+/// One-time QR pairing offer. While open, the TLS server also lets *unknown* devices finish the
+/// handshake, but such a session may only send PAIR_REQUEST with this code (see `server::serve`).
+#[derive(Debug, Default)]
+pub struct PairingWindow {
+    offer: Mutex<Option<Offer>>,
+}
+
+#[derive(Debug)]
+struct Offer {
+    code: String,
+    expires: Instant,
+    attempts: u8,
+}
+
+const PAIRING_TTL: Duration = Duration::from_secs(120);
+const PAIRING_ATTEMPTS: u8 = 3;
+
+impl PairingWindow {
+    /// Opens a 2-minute window and returns a fresh 128-bit code (hex) from the OS CSPRNG.
+    pub fn open(&self) -> Result<String> {
+        let mut bytes = [0u8; 16];
+        ::ring::rand::SecureRandom::fill(&::ring::rand::SystemRandom::new(), &mut bytes)
+            .map_err(|_| anyhow::anyhow!("no secure random source"))?;
+        let code = hex(&bytes);
+        *self.offer.lock().unwrap() = Some(Offer {
+            code: code.clone(),
+            expires: Instant::now() + PAIRING_TTL,
+            attempts: 0,
+        });
+        Ok(code)
+    }
+
+    pub fn close(&self) {
+        *self.offer.lock().unwrap() = None;
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.offer
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|o| Instant::now() < o.expires)
+    }
+
+    /// True once for the right code. The offer closes on success, on expiry, and after 3 wrong codes.
+    pub fn redeem(&self, code: &str) -> bool {
+        let mut offer = self.offer.lock().unwrap();
+        let Some(o) = offer.as_mut() else {
+            return false;
+        };
+        if Instant::now() >= o.expires {
+            *offer = None;
+            return false;
+        }
+        #[allow(deprecated)] // still the constant-time compare ring ships in 0.17
+        let ok = ::ring::constant_time::verify_slices_are_equal(o.code.as_bytes(), code.as_bytes())
+            .is_ok();
+        o.attempts += 1;
+        if ok || o.attempts >= PAIRING_ATTEMPTS {
+            *offer = None;
+        }
+        ok
+    }
 }

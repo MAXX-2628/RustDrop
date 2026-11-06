@@ -20,6 +20,8 @@ import app.rustdrop.ui.Actions
 import app.rustdrop.ui.PickKind
 import app.rustdrop.ui.RustDropTheme
 import app.rustdrop.ui.RustDropUi
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
@@ -36,6 +38,9 @@ class MainActivity : ComponentActivity() {
         if (uri != null) prepare { Files.copyTree(this, uri) }
     }
     private val notifications = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
+    private val scanQr = registerForActivityResult(ScanContract()) { result ->
+        result.contents?.let { link -> lifecycleScope.launch { Core.pairWithLink(link) } }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -54,12 +59,34 @@ class MainActivity : ComponentActivity() {
             unpair = Core::unpair,
             copy = { text -> copy(text) },
             openDownloads = { startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)) },
+            scanQr = {
+                scanQr.launch(
+                    ScanOptions()
+                        .setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                        .setPrompt("Scan the QR code shown on the other device")
+                        .setBeepEnabled(false)
+                        .setOrientationLocked(false),
+                )
+            },
+            showQr = Core::startPairing,
+            hideQr = Core::stopPairing,
         )
         setContent {
             RustDropTheme {
                 RustDropUi(actions)
             }
         }
+    }
+
+    // Discovery and the multicast lock only while visible (battery); see Core.setVisible.
+    override fun onStart() {
+        super.onStart()
+        Core.setVisible(true)
+    }
+
+    override fun onStop() {
+        Core.setVisible(false)
+        super.onStop()
     }
 
     override fun onNewIntent(intent: Intent) {

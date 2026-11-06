@@ -75,4 +75,6 @@ dependencies {
     implementation("androidx.documentfile:documentfile:1.1.0")
     implementation("com.composables:icons-lucide:1.1.0")
     implementation("net.java.dev.jna:jna:5.19.1@aar") // required by the UniFFI Kotlin bindings
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0") // QR pairing scanner
+    implementation("com.google.zxing:core:3.5.4")
 }

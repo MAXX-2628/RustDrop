@@ -71,6 +71,12 @@ The big picture:
   - `config` resolves the data and downloads folders (`RUSTDROP_HOME` and `RUSTDROP_DOWNLOADS` override them). The CLI and the apps share it.
   - `discovery` uses `mdns-sd`.
   - `server` handles HELLO/HELLO_ACK, PING/PONG, SEND_REQUEST dispatch, connection limits and timeouts.
+  - QR pairing: `Node::start_pairing` opens a `security::PairingWindow` and returns a `rustdrop://pair?v=1&fp=..&code=..&addr=..` link plus a QR matrix.
+    - The code is 128-bit, single use, expires after 120 s and closes after 3 wrong tries.
+    - While the window is open, the TLS verifier admits unknown client certificates. `server::serve` then lets an untrusted session send only PAIR_REQUEST.
+    - The scanning side (`Node::pair_with_link`, which blocks) pins the fingerprint from the QR.
+    - On success both sides add each other to `trusted.json`. A device that's already trusted keeps its existing label.
+  - `Node::set_discovery(false)` stops mDNS (with a goodbye packet) but keeps receiving. Android turns it off 30 s after the app leaves the screen and releases the multicast lock at the same time.
   - `transfer` works in this order: SEND_REQUEST, then ACCEPT/DECLINE bound to the transfer ID (60 s expiry), then the raw file bytes in order, then TRANSFER_COMPLETE with the SHA-256 hashes, then the receiver's verdict.
     - The receiver validates every remote path with `safe_relative`.
     - Files are staged in `<dest>/.rustdrop-<id>/` and only moved into place after verification. Existing files are never overwritten; a new file gets a ` (n)` suffix instead.
@@ -91,6 +97,7 @@ The big picture:
   - `Files.kt` copies picked or shared content URIs into cache before sending. Received files are verified in app storage, then published to `Download/RustDrop` through MediaStore; a local copy is deleted only after it's fully written.
   - `TransferService` is a dataSync foreground service that runs while any transfer is active.
   - minSdk is 29, the lowest that allows MediaStore Downloads without a storage permission.
+  - QR scanning uses `zxing-android-embedded`, whose scanner asks for the camera permission itself. The manifest makes the camera optional and lets the scanner rotate.
   - Don't name a command after a local variable in `main()`. The generated macro picks up the variable instead (this happened with `trust`).
   - `reveal` only opens paths inside the downloads folder.
   - The UI reads its styles from `shared\design\*.json`, applied as CSS variables by `windows\src\tokens.ts`.

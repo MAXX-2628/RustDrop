@@ -58,6 +58,12 @@ pub enum Message {
         transfer_id: Uuid,
         reason: String,
     },
+    /// QR pairing: the one-time code read from the QR. The only message an untrusted peer may send.
+    PairRequest {
+        code: String,
+    },
+    PairAccept,
+    PairReject,
 }
 
 pub async fn write<W: AsyncWrite + Unpin>(w: &mut W, msg: &Message) -> Result<()> {

@@ -893,3 +893,33 @@ textarea[aria-invalid] {
     grid-column: 2;
   }
 }
+
+/* ---------- QR pairing ---------- */
+
+.qr {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2xl);
+}
+
+.qr-image {
+  width: 220px;
+  height: 220px;
+  border-radius: var(--radius-input);
+}
+
+.qr-text {
+  display: grid;
+  justify-items: start;
+  gap: var(--space-md);
+  max-width: 44ch;
+}
+
+.notice.info {
+  color: var(--color-success);
+}
+
+.panel .notice {
+  margin-bottom: 0;
+}

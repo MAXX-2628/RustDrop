@@ -7,7 +7,9 @@ use std::{path::PathBuf, sync::Arc};
 
 use rustdrop_core::{
     config,
-    node::{IncomingRequest, Listener, Me, Node, PeerInfo, TransferUpdate, TrustedInfo},
+    node::{
+        IncomingRequest, Listener, Me, Node, PairingOffer, PeerInfo, TransferUpdate, TrustedInfo,
+    },
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -26,6 +28,9 @@ impl Listener for Events {
     }
     fn transfer_changed(&self, update: TransferUpdate) {
         let _ = self.0.emit("transfer", update);
+    }
+    fn paired(&self, name: String) {
+        let _ = self.0.emit("paired", name);
     }
     fn failed(&self, message: String) {
         let _ = self.0.emit("fatal", message);
@@ -70,6 +75,16 @@ fn respond(node: State<Shared>, id: String, accept: bool) {
 #[tauri::command]
 fn send(node: State<Shared>, device: String, paths: Vec<String>) -> Answer<String> {
     node.send(device, paths).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn start_pairing(node: State<Shared>) -> Answer<PairingOffer> {
+    node.start_pairing().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn stop_pairing(node: State<Shared>) {
+    node.stop_pairing()
 }
 
 #[tauri::command]
@@ -132,6 +147,8 @@ fn main() {
             respond,
             send,
             cancel,
+            start_pairing,
+            stop_pairing,
             open_downloads,
             reveal
         ])

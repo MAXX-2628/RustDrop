@@ -21,6 +21,8 @@ tokio-rustls.workspace = true
 rcgen.workspace = true
 ring.workspace = true
 mdns-sd.workspace = true
+if-addrs.workspace = true
+qrcode.workspace = true
 uniffi = { workspace = true, optional = true }
 
 [[bin]]
