@@ -16,7 +16,8 @@ uniffi::setup_scaffolding!();
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Wire protocol version advertised during discovery and HELLO.
-pub const PROTOCOL_VERSION: u16 = 1;
+/// 2: file data is framed so either side can cancel mid-transfer.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 #[cfg(test)]
 mod tests {

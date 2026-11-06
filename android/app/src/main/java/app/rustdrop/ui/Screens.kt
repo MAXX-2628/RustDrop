@@ -1,5 +1,16 @@
 package app.rustdrop.ui
 
+import androidx.compose.ui.semantics.liveRegion
+import androidx.compose.ui.semantics.LiveRegionMode
+import androidx.compose.ui.draw.shadow
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.material3.LocalContentColor
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.MutableTransitionState
 import androidx.compose.animation.core.tween
@@ -148,6 +159,7 @@ fun RustDropUi(actions: Actions) {
     var pairName by rememberSaveable { mutableStateOf("") }
     val sp = LocalSpacing.current
 
+    Box(Modifier.fillMaxSize()) {
     Scaffold(
         bottomBar = {
             NavigationBar(containerColor = LocalPalette.current.surface) {
@@ -185,7 +197,8 @@ fun RustDropUi(actions: Actions) {
         }
     }
 
-    requests.firstOrNull()?.let { IncomingDialog(it, actions.respond) }
+    TransferIsland(requests.firstOrNull(), transfers, actions, Modifier.align(Alignment.TopCenter))
+    }
 }
 
 @Composable
@@ -443,7 +456,7 @@ private fun TransferRow(t: Transfer, actions: Actions) {
                 color = if (t.state == TransferState.FAILED) palette.error else palette.textSecondary,
                 modifier = Modifier.weight(1f),
             )
-            if (t.outgoing && t.state in ACTIVE) {
+            if (t.state in ACTIVE && (t.outgoing || t.state != TransferState.WAITING_FOR_ACCEPT)) {
                 TextButton(onClick = { actions.cancel(t.id) }) { Text("Cancel") }
             }
             if (!t.outgoing && t.state == TransferState.COMPLETED) {
@@ -453,47 +466,213 @@ private fun TransferRow(t: Transfer, actions: Actions) {
     }
 }
 
+/**
+ * Dynamic-island style overlay at the top: grows into the accept prompt for a request,
+ * shrinks to a progress pill while files move (tap to expand, with Cancel), then briefly
+ * shows the result. Always dark, like a hardware cut-out.
+ */
 @Composable
-private fun IncomingDialog(request: IncomingRequest, respond: (IncomingRequest, Boolean) -> Unit) {
+private fun TransferIsland(request: IncomingRequest?, transfers: List<Transfer>, actions: Actions, modifier: Modifier = Modifier) {
+    val island = LocalIsland.current
     val sp = LocalSpacing.current
-    val palette = LocalPalette.current
+    // An incoming request is shown by the prompt, not as a waiting pill.
+    val active = transfers.firstOrNull { it.state in ACTIVE && (it.outgoing || it.state != TransferState.WAITING_FOR_ACCEPT) }
+
+    // Flash the result of a transfer that finished while we watched; never replay old ones.
+    val lastState = remember { HashMap<String, TransferState>() }
+    var flash by remember { mutableStateOf<Transfer?>(null) }
+    LaunchedEffect(transfers) {
+        transfers.take(5).forEach { t ->
+            val was = lastState.put(t.id, t.state)
+            if (was != null && was in ACTIVE && t.state !in ACTIVE) flash = t
+        }
+    }
+    LaunchedEffect(flash) {
+        if (flash != null) {
+            delay(3000)
+            flash = null
+        }
+    }
+    var expanded by remember { mutableStateOf(false) }
+    val shown = request != null || active != null || flash != null
+
+    AnimatedVisibility(
+        visible = shown,
+        enter = fadeIn(tween(220)) + slideInVertically(tween(220)) { -it },
+        exit = fadeOut(tween(180)),
+        modifier = modifier.statusBarsPadding().padding(top = sp.sm),
+    ) {
+        val wide = request != null || (active != null && expanded)
+        Column(
+            Modifier
+                .then(if (wide) Modifier.fillMaxWidth(0.94f).widthIn(max = 480.dp) else Modifier)
+                .shadow(12.dp, RoundedCornerShape(28.dp))
+                .background(island.background, RoundedCornerShape(28.dp))
+                .clickable(enabled = request == null && active != null) { expanded = !expanded }
+                .animateContentSize(spring(dampingRatio = 0.8f, stiffness = 400f))
+                .semantics { liveRegion = LiveRegionMode.Polite }
+                .padding(horizontal = sp.lg, vertical = sp.md),
+            verticalArrangement = Arrangement.spacedBy(sp.md),
+        ) {
+            CompositionLocalProvider(LocalContentColor provides island.textPrimary) {
+                val result = flash
+                when {
+                    request != null -> IslandRequest(request, actions)
+                    active != null && expanded -> IslandProgress(active, actions)
+                    active != null -> IslandPill(active)
+                    result != null -> IslandResult(result)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun IslandRequest(request: IncomingRequest, actions: Actions) {
+    val island = LocalIsland.current
+    val sp = LocalSpacing.current
     val count = request.count.toInt()
-    val shown = request.files.take(6)
-    AlertDialog(
-        // Back or tapping outside declines; nothing is ever accepted by default.
-        onDismissRequest = { respond(request, false) },
-        icon = { Icon(if (request.platform == "android") Lucide.Smartphone else Lucide.Monitor, contentDescription = null, tint = palette.primary) },
-        title = { Text("${request.sender} wants to send you ${if (count == 1) "a file" else "$count files"}", textAlign = TextAlign.Center) },
-        text = {
-            Column(verticalArrangement = Arrangement.spacedBy(sp.sm)) {
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(sp.xs)) {
-                    Icon(Lucide.ShieldCheck, contentDescription = null, Modifier.size(16.dp), tint = palette.success)
-                    Text("Paired ${platformName(request.platform)} device. ${formatBytes(request.total.toDouble())} in total.")
-                }
-                Column(
-                    Modifier.fillMaxWidth().background(palette.surface, RoundedCornerShape(LocalRadius.current.input)).padding(sp.md),
-                    verticalArrangement = Arrangement.spacedBy(sp.xs),
-                ) {
-                    shown.forEach { f ->
-                        Row {
-                            Text(f.path, Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
-                            Text(formatBytes(f.size.toDouble()), color = palette.textSecondary)
-                        }
-                    }
-                    if (count > shown.size) Text("and ${count - shown.size} more", color = palette.textSecondary)
-                }
-                Text("Files are checked before they're saved to Downloads/RustDrop.", style = MaterialTheme.typography.bodySmall, color = palette.textSecondary)
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(sp.md)) {
+        Box(Modifier.size(40.dp).background(island.surfaceElevated, CircleShape), contentAlignment = Alignment.Center) {
+            Icon(if (request.platform == "android") Lucide.Smartphone else Lucide.Monitor, contentDescription = null, tint = island.primary)
+        }
+        Column(Modifier.weight(1f)) {
+            Text(
+                "${request.sender} wants to send you ${if (count == 1) "a file" else "$count files"}",
+                style = MaterialTheme.typography.titleMedium,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(sp.xs)) {
+                Icon(Lucide.ShieldCheck, contentDescription = null, Modifier.size(14.dp), tint = island.success)
+                Text("Paired device. ${formatBytes(request.total.toDouble())}", style = MaterialTheme.typography.bodySmall, color = island.textSecondary)
             }
-        },
-        confirmButton = {
-            Button(onClick = { respond(request, true) }) {
-                Icon(Lucide.Download, contentDescription = null, Modifier.size(18.dp))
-                Spacer(Modifier.width(sp.sm))
-                Text("Accept")
+        }
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(sp.xs)) {
+        request.files.take(3).forEach { f ->
+            Row(horizontalArrangement = Arrangement.spacedBy(sp.sm)) {
+                Text(f.path, Modifier.weight(1f), style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(formatBytes(f.size.toDouble()), style = MaterialTheme.typography.bodySmall, color = island.textSecondary)
             }
-        },
-        dismissButton = { OutlinedButton(onClick = { respond(request, false) }) { Text("Decline") } },
+        }
+        if (count > 3) Text("and ${count - 3} more", style = MaterialTheme.typography.bodySmall, color = island.textSecondary)
+    }
+    Row(horizontalArrangement = Arrangement.spacedBy(sp.md)) {
+        OutlinedButton(
+            onClick = { actions.respond(request, false) },
+            modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+            border = BorderStroke(1.dp, island.border),
+            colors = ButtonDefaults.outlinedButtonColors(contentColor = island.textPrimary),
+        ) { Text("Decline") }
+        Button(
+            onClick = { actions.respond(request, true) },
+            modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = island.primaryButton, contentColor = island.onPrimary),
+        ) {
+            Icon(Lucide.Download, contentDescription = null, Modifier.size(18.dp))
+            Spacer(Modifier.width(sp.sm))
+            Text("Accept")
+        }
+    }
+}
+
+private fun percent(t: Transfer) = if (t.total > 0) ((t.done * 100) / t.total).toInt().coerceIn(0, 100) else 0
+
+@Composable
+private fun IslandPill(t: Transfer) {
+    val island = LocalIsland.current
+    val sp = LocalSpacing.current
+    val pct = percent(t)
+    val label = when (t.state) {
+        TransferState.WAITING_FOR_ACCEPT -> "Waiting for ${t.peer}"
+        TransferState.VERIFYING -> "Verifying"
+        else -> if (t.outgoing) "Sending $pct%" else "Receiving $pct%"
+    }
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(sp.sm),
+        modifier = Modifier.semantics(mergeDescendants = true) { contentDescription = "$label. Tap for details and Cancel." },
+    ) {
+        Icon(if (t.outgoing) Lucide.Send else Lucide.Download, contentDescription = null, Modifier.size(16.dp), tint = island.primary)
+        Text(label, style = MaterialTheme.typography.labelLarge, maxLines = 1)
+        if (t.state == TransferState.TRANSFERRING) {
+            CircularProgressIndicator(
+                progress = { pct / 100f },
+                modifier = Modifier.size(18.dp),
+                strokeWidth = 2.5.dp,
+                color = island.primary,
+                trackColor = island.surfaceElevated,
+            )
+        } else {
+            CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.5.dp, color = island.primary, trackColor = island.surfaceElevated)
+        }
+    }
+}
+
+@Composable
+private fun IslandProgress(t: Transfer, actions: Actions) {
+    val island = LocalIsland.current
+    val sp = LocalSpacing.current
+    val pct = percent(t)
+    val seconds = t.flowingAt?.let { (System.currentTimeMillis() - it) / 1000.0 } ?: 0.0
+    val speed = if (seconds > 0.5) t.done / seconds else 0.0
+    val left = if (speed > 0) (t.total - t.done) / speed else null
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(sp.md)) {
+        Icon(if (t.outgoing) Lucide.Send else Lucide.Download, contentDescription = null, tint = island.primary)
+        Column(Modifier.weight(1f)) {
+            Text(
+                if (t.outgoing) "Sending to ${t.peer}" else "Receiving from ${t.peer}",
+                style = MaterialTheme.typography.titleMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Text(
+                buildString {
+                    append("${plural(t.items.toInt(), "item")}, ${formatBytes(t.total.toDouble())}")
+                    if (speed > 0) append(", ${formatBytes(speed)}/s")
+                    left?.let { append(", ${formatDuration(it)} left") }
+                },
+                style = MaterialTheme.typography.bodySmall,
+                color = island.textSecondary,
+            )
+        }
+        Text("$pct%", style = MaterialTheme.typography.titleMedium)
+    }
+    LinearProgressIndicator(
+        progress = { pct / 100f },
+        modifier = Modifier.fillMaxWidth(),
+        color = island.primary,
+        trackColor = island.surfaceElevated,
     )
+    OutlinedButton(
+        onClick = { actions.cancel(t.id) },
+        modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+        border = BorderStroke(1.dp, island.error),
+        colors = ButtonDefaults.outlinedButtonColors(contentColor = island.error),
+    ) {
+        Icon(Lucide.X, contentDescription = null, Modifier.size(16.dp))
+        Spacer(Modifier.width(sp.sm))
+        Text("Cancel transfer")
+    }
+}
+
+@Composable
+private fun IslandResult(t: Transfer) {
+    val island = LocalIsland.current
+    val (icon, color, text) = when (t.state) {
+        TransferState.COMPLETED -> Triple(
+            Lucide.CircleCheck,
+            island.success,
+            if (t.outgoing) "Sent to ${t.peer}" else "Received ${plural(t.items.toInt(), "item")}",
+        )
+        TransferState.FAILED -> Triple(Lucide.CircleAlert, island.error, "Transfer failed")
+        else -> Triple(Lucide.X, island.textSecondary, t.reason ?: "Cancelled")
+    }
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(LocalSpacing.current.sm)) {
+        Icon(icon, contentDescription = null, Modifier.size(18.dp), tint = color)
+        Text(text, style = MaterialTheme.typography.labelLarge, maxLines = 1, overflow = TextOverflow.Ellipsis)
+    }
 }
 
 @OptIn(ExperimentalLayoutApi::class)

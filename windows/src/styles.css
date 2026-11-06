@@ -923,3 +923,33 @@ textarea[aria-invalid] {
 .panel .notice {
   margin-bottom: 0;
 }
+
+/* ---------- Incoming dialog: long names never widen it ---------- */
+
+.dialog {
+  overflow-x: hidden;
+}
+
+.dialog > * {
+  max-width: 100%;
+  min-width: 0;
+}
+
+.dialog h2 {
+  overflow-wrap: anywhere;
+}
+
+.file-list li {
+  align-items: center;
+  min-width: 0;
+}
+
+.file-list .file-name {
+  flex: 1;
+  min-width: 0;
+}
+
+.file-icon {
+  flex: none;
+  color: var(--color-text-secondary);
+}

@@ -82,6 +82,9 @@ The big picture:
     - The server saves each trusted peer's `ip:port` in `trusted.json` (`TrustedDevice.addr`, optional, so older files still load).
     - `probe_known` PINGs those saved addresses on start, on discovery resume, on refresh and after pairing, and lists the devices that answer.
   - `transfer` works in this order: SEND_REQUEST, then ACCEPT/DECLINE bound to the transfer ID (60 s expiry), then the raw file bytes in order, then TRANSFER_COMPLETE with the SHA-256 hashes, then the receiver's verdict.
+    - Protocol v2: file data travels as frames (u32 length + up to 64 KiB). A length of `u32::MAX` means the sender cancelled. The sender splits the stream, so the receiver's CANCEL message can arrive mid-transfer.
+    - `Node::cancel(id)` works in both directions; for an unanswered request it means Decline. The other side gets "Cancelled by the other device".
+    - A receiver that cancels drains the stream before closing; otherwise the OS resets the connection and the sender never sees the CANCEL.
     - The receiver validates every remote path with `safe_relative`.
     - Files are staged in `<dest>/.rustdrop-<id>/` and only moved into place after verification. Existing files are never overwritten; a new file gets a ` (n)` suffix instead.
     - The UI receives an `Event` stream and approves a request by sending `true` on its `oneshot` channel.

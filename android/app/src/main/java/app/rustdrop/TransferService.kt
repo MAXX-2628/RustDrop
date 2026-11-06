@@ -1,40 +1,47 @@
 package app.rustdrop
 
-import android.app.Notification
-import android.app.NotificationChannel
 import android.app.NotificationManager
-import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.IBinder
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
 
-/** Keeps the process alive with a visible notification while any transfer is active. */
+/** Keeps the process alive while a transfer runs; its notification shows live progress and Cancel. */
 class TransferService : Service() {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+
     override fun onBind(intent: Intent?): IBinder? = null
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    override fun onCreate() {
+        super.onCreate()
+        Notifications.createChannels(this)
         val manager = getSystemService(NotificationManager::class.java)
-        manager.createNotificationChannel(
-            NotificationChannel(CHANNEL, "Transfers", NotificationManager.IMPORTANCE_LOW).apply {
-                description = "Shown while RustDrop sends or receives files"
-            },
+        scope.launch {
+            Core.transfers.map { list -> list.firstOrNull { it.state in ACTIVE } }
+                .distinctUntilChanged()
+                .collect { t -> manager.notify(Notifications.TRANSFER_ID, Notifications.transfer(this@TransferService, t)) }
+        }
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        val current = Core.transfers.value.firstOrNull { it.state in ACTIVE }
+        startForeground(
+            Notifications.TRANSFER_ID,
+            Notifications.transfer(this, current),
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
         )
-        val open = PendingIntent.getActivity(
-            this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE,
-        )
-        val notification = Notification.Builder(this, CHANNEL)
-            .setSmallIcon(android.R.drawable.stat_sys_upload)
-            .setContentTitle("Transferring files")
-            .setContentText("RustDrop keeps working while the transfer finishes.")
-            .setContentIntent(open)
-            .setOngoing(true)
-            .build()
-        startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
         return START_NOT_STICKY
     }
 
-    private companion object {
-        const val CHANNEL = "transfers"
+    override fun onDestroy() {
+        scope.cancel()
+        super.onDestroy()
     }
 }

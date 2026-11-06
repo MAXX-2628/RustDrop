@@ -53,7 +53,7 @@ class MainActivity : ComponentActivity() {
             send = Core::send,
             clearStaged = Core::clearStaged,
             refresh = { if (Core.started) Core.node.refresh() },
-            cancel = { id -> Core.node.cancel(id) },
+            cancel = Core::cancel,
             respond = Core::respond,
             pair = Core::pair,
             unpair = Core::unpair,

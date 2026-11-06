@@ -17,7 +17,7 @@ use std::{
 use serde::Serialize;
 use tokio::{
     runtime::{Builder, Handle, Runtime},
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     task::JoinHandle,
 };
 use uuid::Uuid;
@@ -158,7 +158,8 @@ struct Inner {
     rt: Handle,
     peers: Mutex<HashMap<Uuid, Peer>>,
     pending: Mutex<HashMap<Uuid, oneshot::Sender<bool>>>,
-    sends: Mutex<HashMap<Uuid, JoinHandle<()>>>,
+    sends: Mutex<HashMap<Uuid, watch::Sender<bool>>>,
+    inbox: Mutex<Option<Arc<Inbox>>>,
     error: Mutex<Option<String>>,
     pairing: Arc<PairingWindow>,
     port: Mutex<Option<u16>>,
@@ -198,6 +199,15 @@ fn progress(id: Uuid, done: u64, total: u64) -> TransferUpdate {
         state: Some(s),
         ..Default::default()
     }
+}
+
+fn cancelled_update(id: Uuid, by_peer: bool) -> TransferUpdate {
+    let reason = if by_peer {
+        "Cancelled by the other device"
+    } else {
+        "You cancelled"
+    };
+    state(id, TransferState::Cancelled, Some(reason))
 }
 
 /// Short, actionable failure text for UIs (DESIGN.md §14).
@@ -244,6 +254,7 @@ impl Node {
             peers: Mutex::default(),
             pending: Mutex::default(),
             sends: Mutex::default(),
+            inbox: Mutex::default(),
             error: Mutex::default(),
             pairing: Arc::default(),
             port: Mutex::default(),
@@ -368,33 +379,38 @@ impl Node {
 
         let node = self.inner.clone();
         let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
-        // Hold the lock across spawn so the task cannot remove its entry before it is inserted.
-        let mut sends = self.inner.sends.lock().unwrap();
-        let task = self.inner.rt.spawn(async move {
+        let (cancel_tx, cancel) = watch::channel(false);
+        self.inner.sends.lock().unwrap().insert(id, cancel_tx);
+        self.inner.rt.spawn(async move {
             let tick = node.listener.clone();
-            let result = transfer::send(addr, &node.identity, node.trust.clone(), &paths, {
-                move |done, total| tick.transfer_changed(progress(id, done, total))
-            })
-            .await;
+            let result =
+                transfer::send(addr, &node.identity, node.trust.clone(), &paths, cancel, {
+                    move |done, total| tick.transfer_changed(progress(id, done, total))
+                })
+                .await;
             node.sends.lock().unwrap().remove(&id);
             let update = match result {
                 Ok(Outcome::Completed) => state(id, TransferState::Completed, None),
                 Ok(Outcome::Declined) => state(id, TransferState::Cancelled, Some("Declined")),
+                Ok(Outcome::Cancelled { by_peer }) => cancelled_update(id, by_peer),
                 Err(e) => state(id, TransferState::Failed, Some(&friendly(&e))),
             };
             node.listener.transfer_changed(update);
         });
-        sends.insert(id, task);
         Ok(id.to_string())
     }
 
-    /// Cancels an outgoing transfer; the receiver discards everything it staged.
+    /// Cancels a transfer in either direction (an unanswered incoming request is declined).
+    /// The other device is told, shows it as cancelled, and discards anything partly received.
     pub fn cancel(&self, id: String) {
         let Ok(id) = Uuid::parse_str(&id) else { return };
-        if let Some(task) = self.inner.sends.lock().unwrap().remove(&id) {
-            task.abort();
-            let update = state(id, TransferState::Cancelled, Some("Cancelled"));
-            self.inner.listener.transfer_changed(update);
+        if let Some(tx) = self.inner.sends.lock().unwrap().get(&id) {
+            let _ = tx.send(true);
+            return;
+        }
+        let incoming = self.inner.inbox.lock().unwrap().clone();
+        if let Some(inbox) = incoming {
+            inbox.cancel(id);
         }
     }
 
@@ -678,6 +694,13 @@ impl Inner {
                 transfer_id,
                 reason,
             } => state(transfer_id, TransferState::Failed, Some(&reason)),
+            Event::Cancelled {
+                transfer_id,
+                by_peer,
+            } => {
+                self.pending.lock().unwrap().remove(&transfer_id);
+                cancelled_update(transfer_id, by_peer)
+            }
             Event::Paired { name } => {
                 self.listener.paired(name);
                 self.recheck_all();
@@ -701,6 +724,7 @@ async fn run(node: Arc<Inner>) -> anyhow::Result<()> {
     *node.port.lock().unwrap() = Some(port);
     let (tx, mut events) = mpsc::channel(32);
     let inbox = Arc::new(Inbox::new(node.downloads.clone(), tx));
+    *node.inbox.lock().unwrap() = Some(inbox.clone());
     tokio::spawn(server::listen(
         listener,
         node.identity.clone(),

@@ -5,7 +5,7 @@
 //! files into place without overwriting anything.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -16,7 +16,7 @@ use ring::digest;
 use tokio::{
     fs,
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
-    sync::{mpsc, oneshot},
+    sync::{mpsc, oneshot, watch},
     time::timeout,
 };
 use uuid::Uuid;
@@ -74,6 +74,11 @@ pub enum Event {
     Paired {
         name: String,
     },
+    /// The transfer stopped because someone cancelled it. `by_peer`: the sender did, not this device.
+    Cancelled {
+        transfer_id: Uuid,
+        by_peer: bool,
+    },
 }
 
 /// Receiver state shared by all sessions.
@@ -81,6 +86,7 @@ pub struct Inbox {
     dest: PathBuf,
     events: mpsc::Sender<Event>,
     used_ids: Mutex<HashSet<Uuid>>,
+    cancels: Mutex<HashMap<Uuid, watch::Sender<bool>>>,
 }
 
 impl Inbox {
@@ -89,13 +95,56 @@ impl Inbox {
             dest,
             events,
             used_ids: Mutex::new(HashSet::new()),
+            cancels: Mutex::default(),
         }
     }
 
     pub(crate) async fn notify(&self, event: Event) {
         let _ = self.events.send(event).await;
     }
+
+    /// Cancels an incoming transfer (or declines it if it is still waiting). False if unknown.
+    pub fn cancel(&self, transfer_id: Uuid) -> bool {
+        let cancels = self.cancels.lock().unwrap();
+        cancels
+            .get(&transfer_id)
+            .is_some_and(|tx| tx.send(true).is_ok())
+    }
 }
+
+/// Marks a transfer stopped by a cancel (not a failure), so callers can report it as such.
+#[derive(Debug)]
+pub(crate) struct Cancelled {
+    pub by_peer: bool,
+}
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.by_peer {
+            "cancelled by the other device"
+        } else {
+            "cancelled"
+        })
+    }
+}
+
+impl std::error::Error for Cancelled {}
+
+/// Resolves once `rx` is set to true. A dropped sender never cancels.
+async fn cancelled(rx: &mut watch::Receiver<bool>) {
+    loop {
+        if *rx.borrow_and_update() {
+            return;
+        }
+        if rx.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
+/// File data travels as frames: u32 length (1..=BUF) then the bytes. This length means
+/// "the sender cancelled"; the stream ends after it.
+const CANCEL_MARK: u32 = u32::MAX;
 
 /// Transfer states shown by every UI (ARCHITECTURE.md §11).
 #[derive(serde::Serialize, Clone, Copy, Debug, PartialEq)]
@@ -114,6 +163,10 @@ pub enum TransferState {
 pub enum Outcome {
     Completed,
     Declined,
+    /// Someone cancelled after accepting; `by_peer`: the receiver did.
+    Cancelled {
+        by_peer: bool,
+    },
 }
 
 /// Rate-limits progress reports so UIs are not flooded (DESIGN.md §12).
@@ -135,7 +188,9 @@ impl Progress {
     /// Records `n` bytes; true when a report is due.
     fn tick(&mut self, n: usize) -> bool {
         self.done += n as u64;
-        let due = self.done == self.total || self.last.elapsed() >= PROGRESS_EVERY;
+        // Report the first chunk at once, so UIs show progress as soon as bytes move.
+        let first = self.done == n as u64;
+        let due = first || self.done == self.total || self.last.elapsed() >= PROGRESS_EVERY;
         if due {
             self.last = Instant::now();
         }
@@ -236,6 +291,38 @@ pub(crate) async fn receive<S: AsyncRead + AsyncWrite + Unpin>(
     };
     let sizes: Vec<u64> = files.iter().map(|f| f.size).collect();
 
+    let (cancel_tx, mut cancel) = watch::channel(false);
+    inbox.cancels.lock().unwrap().insert(transfer_id, cancel_tx);
+    let result = run_receive(
+        stream,
+        peer,
+        trusted_name,
+        transfer_id,
+        files,
+        &paths,
+        &sizes,
+        total,
+        &mut cancel,
+        inbox,
+    )
+    .await;
+    inbox.cancels.lock().unwrap().remove(&transfer_id);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_receive<S: AsyncRead + AsyncWrite + Unpin>(
+    stream: &mut S,
+    peer: &DeviceInfo,
+    trusted_name: &str,
+    transfer_id: Uuid,
+    files: Vec<FileMeta>,
+    paths: &[PathBuf],
+    sizes: &[u64],
+    total: u64,
+    cancel: &mut watch::Receiver<bool>,
+    inbox: &Inbox,
+) -> Result<()> {
     let (decision, answer) = oneshot::channel();
     let request = Incoming {
         transfer_id,
@@ -245,7 +332,15 @@ pub(crate) async fn receive<S: AsyncRead + AsyncWrite + Unpin>(
         decision,
     };
     let _ = inbox.events.send(Event::Incoming(request)).await;
-    let accepted = matches!(timeout(DECISION_TIMEOUT, answer).await, Ok(Ok(true)));
+    // While the user decides, the sender may cancel (or disconnect); cancelling here = declining.
+    let accepted = tokio::select! {
+        r = timeout(DECISION_TIMEOUT, answer) => matches!(r, Ok(Ok(true))),
+        _ = cancelled(cancel) => false,
+        _ = protocol::read(stream) => {
+            inbox.notify(Event::Cancelled { transfer_id, by_peer: true }).await;
+            return Err(Cancelled { by_peer: true }.into());
+        }
+    };
     if !accepted {
         protocol::write(stream, &Message::Decline { transfer_id }).await?;
         return Ok(());
@@ -253,7 +348,17 @@ pub(crate) async fn receive<S: AsyncRead + AsyncWrite + Unpin>(
     protocol::write(stream, &Message::Accept { transfer_id }).await?;
 
     let staging = inbox.dest.join(format!(".rustdrop-{transfer_id}"));
-    let result = receive_files(stream, transfer_id, &paths, &sizes, total, &staging, inbox).await;
+    let result = receive_files(
+        stream,
+        transfer_id,
+        paths,
+        sizes,
+        total,
+        &staging,
+        cancel,
+        inbox,
+    )
+    .await;
     let _ = fs::remove_dir_all(&staging).await;
 
     match result {
@@ -263,11 +368,29 @@ pub(crate) async fn receive<S: AsyncRead + AsyncWrite + Unpin>(
                 sha256,
             };
             protocol::write(stream, &reply).await?;
-            let _ = inbox
-                .events
-                .send(Event::Completed { transfer_id, saved })
-                .await;
+            inbox.notify(Event::Completed { transfer_id, saved }).await;
             Ok(())
+        }
+        Err(e) if e.is::<Cancelled>() => {
+            let by_peer = e.downcast_ref::<Cancelled>().is_some_and(|c| c.by_peer);
+            if !by_peer {
+                // Tell the sender, which reads replies while it streams.
+                let reply = Message::Cancel { transfer_id };
+                let _ = timeout(Duration::from_secs(2), protocol::write(stream, &reply)).await;
+                // Keep reading until the sender hangs up. Closing with unread data makes the OS
+                // reset the connection, and the sender may then never see the CANCEL.
+                let mut sink = vec![0u8; BUF];
+                let drain =
+                    async { while matches!(stream.read(&mut sink).await, Ok(n) if n > 0) {} };
+                let _ = timeout(Duration::from_secs(2), drain).await;
+            }
+            inbox
+                .notify(Event::Cancelled {
+                    transfer_id,
+                    by_peer,
+                })
+                .await;
+            Err(e)
         }
         Err(e) => {
             // Generic reason on the wire: local paths and errors stay on this device.
@@ -277,9 +400,8 @@ pub(crate) async fn receive<S: AsyncRead + AsyncWrite + Unpin>(
             };
             let _ = timeout(Duration::from_secs(2), protocol::write(stream, &reply)).await;
             let reason = format!("{e:#}");
-            let _ = inbox
-                .events
-                .send(Event::Failed {
+            inbox
+                .notify(Event::Failed {
                     transfer_id,
                     reason,
                 })
@@ -289,6 +411,7 @@ pub(crate) async fn receive<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn receive_files<S: AsyncRead + Unpin>(
     stream: &mut S,
     transfer_id: Uuid,
@@ -296,6 +419,7 @@ async fn receive_files<S: AsyncRead + Unpin>(
     sizes: &[u64],
     total: u64,
     staging: &Path,
+    cancel: &mut watch::Receiver<bool>,
     inbox: &Inbox,
 ) -> Result<(Vec<PathBuf>, Vec<String>)> {
     let mut buf = vec![0u8; BUF];
@@ -313,9 +437,21 @@ async fn receive_files<S: AsyncRead + Unpin>(
         let mut hash = digest::Context::new(&digest::SHA256);
         let mut left = size;
         while left > 0 {
-            let want = left.min(BUF as u64) as usize;
-            let n = timeout(IDLE_TIMEOUT, stream.read(&mut buf[..want])).await??;
-            ensure!(n > 0, "sender disconnected");
+            // Dropping a half-read frame on cancel is fine: the session ends right after.
+            let len = tokio::select! {
+                biased;
+                _ = cancelled(cancel) => return Err(Cancelled { by_peer: false }.into()),
+                r = timeout(IDLE_TIMEOUT, stream.read_u32()) => r??,
+            };
+            if len == CANCEL_MARK {
+                return Err(Cancelled { by_peer: true }.into());
+            }
+            let n = len as usize;
+            ensure!(
+                n > 0 && n <= BUF && len as u64 <= left,
+                "bad data frame of {len} bytes"
+            );
+            timeout(IDLE_TIMEOUT, stream.read_exact(&mut buf[..n])).await??;
             hash.update(&buf[..n]);
             file.write_all(&buf[..n]).await?;
             left -= n as u64;
@@ -409,12 +545,13 @@ fn add(path: &Path, rel: String, out: &mut Vec<(PathBuf, FileMeta)>) -> Result<(
 }
 
 /// Sends files/folders to a trusted peer. `progress(done, total)` is called at most every 200 ms.
-/// Dropping the future cancels the transfer; the receiver discards everything it staged.
+/// Setting `cancel` to true stops the transfer cleanly: the receiver is told and discards what it staged.
 pub async fn send(
     addr: std::net::SocketAddr,
     identity: &Identity,
     trust: Arc<TrustStore>,
     paths: &[PathBuf],
+    mut cancel: watch::Receiver<bool>,
     mut progress: impl FnMut(u64, u64),
 ) -> Result<Outcome> {
     let owned = paths.to_vec();
@@ -425,19 +562,30 @@ pub async fn send(
             .unzip();
     let (_, total) = validate(&files)?; // same rules as the receiver: fail before connecting
 
-    let (mut tls, _peer) = server::connect(addr, identity, trust).await?;
+    let (tls, _peer) = server::connect(addr, identity, trust).await?;
+    // Split so the receiver's CANCEL can be read while file data is being written.
+    let (mut rd, mut wr) = tokio::io::split(tls);
     let transfer_id = Uuid::new_v4();
     let request = Message::SendRequest {
         transfer_id,
         files: files.clone(),
     };
-    protocol::write(&mut tls, &request).await?;
-    match timeout(DECISION_TIMEOUT + IDLE_TIMEOUT, protocol::read(&mut tls)).await?? {
+    protocol::write(&mut wr, &request).await?;
+    let reply = tokio::select! {
+        r = timeout(DECISION_TIMEOUT + IDLE_TIMEOUT, protocol::read(&mut rd)) => r??,
+        _ = cancelled(&mut cancel) => {
+            let _ = protocol::write(&mut wr, &Message::Cancel { transfer_id }).await;
+            return Ok(Outcome::Cancelled { by_peer: false });
+        }
+    };
+    match reply {
         Message::Accept { transfer_id: id } if id == transfer_id => {}
         Message::Decline { transfer_id: id } if id == transfer_id => return Ok(Outcome::Declined),
         other => bail!("expected ACCEPT or DECLINE, got {other:?}"),
     }
 
+    // One read stays pending for the whole stream: the receiver's verdict, or its CANCEL.
+    let mut reply = Box::pin(protocol::read(&mut rd));
     let mut buf = vec![0u8; BUF];
     let mut hashes = Vec::with_capacity(files.len());
     let mut ticker = Progress::new(total);
@@ -446,11 +594,33 @@ pub async fn send(
         let mut hash = digest::Context::new(&digest::SHA256);
         let mut left = meta.size;
         while left > 0 {
+            // Checked between frames, never mid-frame, so the stream stays parseable.
+            if *cancel.borrow() {
+                let _ = wr.write_u32(CANCEL_MARK).await;
+                let _ = wr.shutdown().await;
+                return Ok(Outcome::Cancelled { by_peer: false });
+            }
             let want = left.min(BUF as u64) as usize;
             let n = file.read(&mut buf[..want]).await?;
             ensure!(n > 0, "{} changed while sending", meta.path);
             hash.update(&buf[..n]);
-            timeout(IDLE_TIMEOUT, tls.write_all(&buf[..n])).await??;
+            let written = tokio::select! {
+                biased;
+                msg = &mut reply => return verdict_mid_stream(msg),
+                r = timeout(IDLE_TIMEOUT, write_frame(&mut wr, &buf[..n])) => r,
+            };
+            if let Err(e) = written
+                .map_err(anyhow::Error::from)
+                .and_then(|r| r.map_err(Into::into))
+            {
+                // A write fails once the receiver has hung up; its CANCEL may already be waiting.
+                return match timeout(Duration::from_millis(500), &mut reply).await {
+                    Ok(msg @ Ok(Message::Cancel { .. } | Message::TransferFailed { .. })) => {
+                        verdict_mid_stream(msg)
+                    }
+                    _ => Err(e),
+                };
+            }
             left -= n as u64;
             if ticker.tick(n) {
                 progress(ticker.done, total);
@@ -462,9 +632,9 @@ pub async fn send(
         transfer_id,
         sha256: hashes,
     };
-    protocol::write(&mut tls, &done).await?;
+    protocol::write(&mut wr, &done).await?;
 
-    let result = match timeout(IDLE_TIMEOUT, protocol::read(&mut tls)).await?? {
+    let result = match timeout(IDLE_TIMEOUT, &mut reply).await?? {
         Message::TransferComplete {
             transfer_id: id, ..
         } if id == transfer_id => Ok(Outcome::Completed),
@@ -472,10 +642,25 @@ pub async fn send(
             transfer_id: id,
             reason,
         } if id == transfer_id => Err(anyhow!("transfer failed: {reason}")),
+        Message::Cancel { .. } => Ok(Outcome::Cancelled { by_peer: true }),
         other => Err(anyhow!("expected TRANSFER_COMPLETE, got {other:?}")),
     };
-    let _ = tls.shutdown().await;
+    let _ = wr.shutdown().await;
     result
+}
+
+/// What the receiver said while we were still streaming.
+fn verdict_mid_stream(msg: Result<Message>) -> Result<Outcome> {
+    match msg? {
+        Message::Cancel { .. } => Ok(Outcome::Cancelled { by_peer: true }),
+        Message::TransferFailed { reason, .. } => Err(anyhow!("transfer failed: {reason}")),
+        other => Err(anyhow!("unexpected {other:?} during transfer")),
+    }
+}
+
+async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, data: &[u8]) -> std::io::Result<()> {
+    w.write_u32(data.len() as u32).await?;
+    w.write_all(data).await
 }
 
 #[cfg(test)]
@@ -543,6 +728,118 @@ mod tests {
         (a, b)
     }
 
+    fn never() -> watch::Receiver<bool> {
+        watch::channel(false).1
+    }
+
+    fn big_file(tag: &str, mb: usize) -> PathBuf {
+        let src = temp_dir(tag);
+        std::fs::create_dir_all(&src).unwrap();
+        let path = src.join("big.bin");
+        std::fs::write(&path, vec![7u8; mb << 20]).unwrap();
+        path
+    }
+
+    fn staging_is_gone(dest: &Path) -> bool {
+        std::fs::read_dir(dest).map_or(true, |d| d.count() == 0)
+    }
+
+    #[tokio::test]
+    async fn sender_cancels_mid_transfer() {
+        let ((a, a_trust), (b, b_trust)) = trusted_pair();
+        let dest = temp_dir("dest");
+        let s = start(b, b_trust, dest.clone()).await;
+        let mut events = s.events;
+        let path = big_file("src", 8);
+
+        let (cancel_tx, cancel) = watch::channel(false);
+        let receiver = tokio::spawn(async move {
+            while let Some(ev) = events.recv().await {
+                match ev {
+                    Event::Incoming(req) => {
+                        let _ = req.decision.send(true);
+                    }
+                    Event::Cancelled { by_peer, .. } => return Some(by_peer),
+                    Event::Completed { .. } | Event::Failed { .. } => return None,
+                    _ => {}
+                }
+            }
+            None
+        });
+        // Cancel as soon as the first chunk has gone out.
+        let outcome = send(s.addr, &a, a_trust, &[path], cancel, move |_, _| {
+            let _ = cancel_tx.send(true);
+        })
+        .await;
+        assert_eq!(outcome.unwrap(), Outcome::Cancelled { by_peer: false });
+        assert_eq!(
+            receiver.await.unwrap(),
+            Some(true),
+            "receiver sees the sender's cancel"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(staging_is_gone(&dest));
+    }
+
+    #[tokio::test]
+    async fn receiver_cancels_mid_transfer() {
+        let ((a, a_trust), (b, b_trust)) = trusted_pair();
+        let dest = temp_dir("dest");
+        let s = start(b, b_trust, dest.clone()).await;
+        let (mut events, inbox) = (s.events, s.inbox);
+        let path = big_file("src", 16);
+
+        let receiver = tokio::spawn(async move {
+            while let Some(ev) = events.recv().await {
+                match ev {
+                    Event::Incoming(req) => {
+                        let _ = req.decision.send(true);
+                    }
+                    Event::Progress { transfer_id, .. } => {
+                        inbox.cancel(transfer_id);
+                    }
+                    Event::Cancelled { by_peer, .. } => return Some(by_peer),
+                    Event::Completed { .. } | Event::Failed { .. } => return None,
+                    _ => {}
+                }
+            }
+            None
+        });
+        let outcome = send(s.addr, &a, a_trust, &[path], never(), |_, _| {}).await;
+        assert_eq!(outcome.unwrap(), Outcome::Cancelled { by_peer: true });
+        assert_eq!(receiver.await.unwrap(), Some(false));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(staging_is_gone(&dest));
+    }
+
+    #[tokio::test]
+    async fn sender_cancels_while_receiver_is_asked() {
+        let ((a, a_trust), (b, b_trust)) = trusted_pair();
+        let s = start(b, b_trust, temp_dir("dest")).await;
+        let mut events = s.events;
+        let path = big_file("src", 1);
+        let (cancel_tx, cancel) = watch::channel(false);
+
+        let receiver = tokio::spawn(async move {
+            let mut held = Vec::new(); // dropping a request would count as Decline
+            while let Some(ev) = events.recv().await {
+                match ev {
+                    // Keep the request open (unanswered); the sender gives up meanwhile.
+                    Event::Incoming(req) => {
+                        held.push(req);
+                        let _ = cancel_tx.send(true);
+                    }
+                    Event::Cancelled { by_peer, .. } => return Some(by_peer),
+                    _ => {}
+                }
+            }
+            None
+        });
+        let outcome = send(s.addr, &a, a_trust, &[path], cancel, |_, _| {}).await;
+        assert_eq!(outcome.unwrap(), Outcome::Cancelled { by_peer: false });
+        assert_eq!(receiver.await.unwrap(), Some(true));
+    }
+
     /// Answers every incoming request with `accept`.
     fn auto_answer(mut events: mpsc::Receiver<Event>, accept: bool) {
         tokio::spawn(async move {
@@ -569,12 +866,12 @@ mod tests {
         std::fs::write(src.join("folder/sub/two.bin"), &big).unwrap();
 
         let paths = [src.join("one.txt"), src.join("folder")];
-        let outcome = send(addr, &a, a_trust.clone(), &paths, |_, _| {}).await;
+        let outcome = send(addr, &a, a_trust.clone(), &paths, never(), |_, _| {}).await;
         assert_eq!(outcome.unwrap(), Outcome::Completed);
         assert_eq!(std::fs::read(dest.join("one.txt")).unwrap(), b"one");
         assert_eq!(std::fs::read(dest.join("folder/sub/two.bin")).unwrap(), big);
 
-        let again = send(addr, &a, a_trust, &paths[..1], |_, _| {}).await;
+        let again = send(addr, &a, a_trust, &paths[..1], never(), |_, _| {}).await;
         assert_eq!(again.unwrap(), Outcome::Completed);
         assert_eq!(std::fs::read(dest.join("one (1).txt")).unwrap(), b"one");
         assert_eq!(std::fs::read(dest.join("one.txt")).unwrap(), b"one");
@@ -591,7 +888,15 @@ mod tests {
         let src = temp_dir("src");
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("one.txt"), "one").unwrap();
-        let outcome = send(addr, &a, a_trust, &[src.join("one.txt")], |_, _| {}).await;
+        let outcome = send(
+            addr,
+            &a,
+            a_trust,
+            &[src.join("one.txt")],
+            never(),
+            |_, _| {},
+        )
+        .await;
         assert_eq!(outcome.unwrap(), Outcome::Declined);
         assert!(!dest.join("one.txt").exists());
     }

@@ -7,6 +7,7 @@ import {
   Clock,
   Copy,
   Download,
+  File,
   Files,
   Folder,
   History,
@@ -111,7 +112,11 @@ export function App() {
     const stopSearching = setTimeout(() => setSearching(false), 4000);
     const subs = [
       events.peers(setPeers),
-      events.transfer(merge),
+      events.transfer((u) => {
+        merge(u);
+        // The sender cancelled (or it expired): close its accept dialog.
+        if (u.state && u.state !== "WAITING_FOR_ACCEPT") setRequests((q) => q.filter((r) => r.id !== u.id));
+      }),
       events.fatal(setFatal),
       events.paired((name) => {
         setLastPaired({ name, at: Date.now() });
@@ -542,7 +547,7 @@ function TransferRow({ t, onCancel, onReveal }: { t: Transfer; onCancel: (id: st
         </p>
       </div>
       <div className="transfer-actions">
-        {t.outgoing && ACTIVE.includes(t.state) && (
+        {ACTIVE.includes(t.state) && (t.outgoing || t.state !== "WAITING_FOR_ACCEPT") && (
           <button className="btn tertiary" onClick={() => onCancel(t.id)}>
             <X size={16} aria-hidden />
             Cancel
@@ -587,7 +592,8 @@ function IncomingDialog({ request, onAnswer }: { request: IncomingRequest; onAns
         </p>
         <ul className="file-list">
           {shown.map((f) => (
-            <li key={f.path}>
+            <li key={f.path} title={f.path}>
+              <File size={16} aria-hidden className="file-icon" />
               <span className="file-name">{f.path}</span>
               <span className="file-size">{formatBytes(f.size)}</span>
             </li>

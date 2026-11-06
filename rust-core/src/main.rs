@@ -145,6 +145,7 @@ async fn show_events(mut events: mpsc::Receiver<Event>) {
             }
             Event::Failed { reason, .. } => println!("\ntransfer failed: {reason}"),
             Event::Paired { name } => println!("\npaired with {name}"),
+            Event::Cancelled { .. } => println!("\ntransfer cancelled"),
         }
     }
 }
@@ -175,14 +176,23 @@ async fn send(
 
     println!("sending to {name}, waiting for them to accept...");
     let paths: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
-    let outcome = transfer::send(addr, &identity, trust, &paths, |done, total| {
-        print!("\rsending {}%", done * 100 / total.max(1));
-        let _ = std::io::stdout().flush();
-    })
+    let (_keep, never_cancel) = tokio::sync::watch::channel(false);
+    let outcome = transfer::send(
+        addr,
+        &identity,
+        trust,
+        &paths,
+        never_cancel,
+        |done, total| {
+            print!("\rsending {}%", done * 100 / total.max(1));
+            let _ = std::io::stdout().flush();
+        },
+    )
     .await?;
     match outcome {
         Outcome::Completed => println!("\ndone: {name} received and verified everything"),
         Outcome::Declined => println!("{name} declined"),
+        Outcome::Cancelled { .. } => println!("\n{name} cancelled the transfer"),
     }
     Ok(())
 }

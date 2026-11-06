@@ -10,6 +10,8 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <!-- Android 16 Live Update (status-bar chip) for the ongoing transfer -->
+    <uses-permission android:name="android.permission.POST_PROMOTED_NOTIFICATIONS" />
     <!-- QR pairing scanner (the scanner asks for CAMERA itself); phones without a camera can still pair by fingerprint. -->
     <uses-feature android:name="android.hardware.camera" android:required="false" tools:replace="android:required" />
 
@@ -46,6 +48,11 @@
             android:name=".TransferService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <!-- Cancel / Decline buttons in notifications -->
+        <receiver
+            android:name=".ActionReceiver"
+            android:exported="false" />
 
         <!-- Let the scanner follow the phone's rotation instead of forcing landscape. -->
         <activity

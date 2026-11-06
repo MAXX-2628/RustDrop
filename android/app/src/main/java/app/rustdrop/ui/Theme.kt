@@ -60,6 +60,9 @@ val LocalRadius = staticCompositionLocalOf<Radius> { error("RustDropTheme not ap
 val LocalThemePreference = staticCompositionLocalOf<(ThemePreference) -> Unit> { {} }
 val LocalCurrentTheme = staticCompositionLocalOf { ThemePreference.System }
 
+/** The transfer island is always dark, like a hardware cut-out, whatever the theme. */
+val LocalIsland = staticCompositionLocalOf<Palette> { error("RustDropTheme not applied") }
+
 private fun json(ctx: Context, name: String) =
     JSONObject(ctx.assets.open("design/$name.json").bufferedReader().use { it.readText() })
 
@@ -166,6 +169,7 @@ fun RustDropTheme(content: @Composable () -> Unit) {
             LocalSpacing provides tokens.spacing,
             LocalRadius provides tokens.radius,
             LocalCurrentTheme provides preference,
+            LocalIsland provides tokens.dark,
             LocalThemePreference provides { next ->
                 preference = next
                 prefs.edit { putString("theme", next.name) }

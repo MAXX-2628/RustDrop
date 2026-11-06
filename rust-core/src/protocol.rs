@@ -38,6 +38,10 @@ pub struct FileMeta {
 pub enum Message {
     Hello(DeviceInfo),
     HelloAck(DeviceInfo),
+    /// Either side stops a transfer (before or after ACCEPT).
+    Cancel {
+        transfer_id: Uuid,
+    },
     Ping {
         nonce: u64,
     },

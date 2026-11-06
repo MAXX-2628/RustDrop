@@ -3,37 +3,99 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use rustdrop_core::{
     config,
     node::{
         IncomingRequest, Listener, Me, Node, PairingOffer, PeerInfo, TransferUpdate, TrustedInfo,
     },
+    transfer::TransferState,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_notification::NotificationExt;
 
 type Shared = Arc<Node>;
 type Answer<T> = Result<T, String>;
 
-/// Forwards core events to the webview.
-struct Events(AppHandle);
+/// Forwards core events to the webview, and raises Windows notifications for what the user
+/// must see even when RustDrop is in the background: a request to accept, and cancellations.
+struct Events {
+    app: AppHandle,
+    /// Transfer id -> other device's name (the first update of each transfer carries it).
+    peers: Mutex<HashMap<String, String>>,
+}
+
+impl Events {
+    fn notify(&self, title: &str, body: &str) {
+        let _ = self
+            .app
+            .notification()
+            .builder()
+            .title(title)
+            .body(body)
+            .show();
+    }
+
+    fn focused(&self) -> bool {
+        self.app
+            .get_webview_window("main")
+            .and_then(|w| w.is_focused().ok())
+            .unwrap_or(false)
+    }
+}
 
 impl Listener for Events {
     fn peers_changed(&self, peers: Vec<PeerInfo>) {
-        let _ = self.0.emit("peers", peers);
+        let _ = self.app.emit("peers", peers);
     }
     fn incoming(&self, request: IncomingRequest) {
-        let _ = self.0.emit("incoming", request);
+        if !self.focused() {
+            let what = if request.count == 1 {
+                "a file".into()
+            } else {
+                format!("{} files", request.count)
+            };
+            self.notify(
+                &format!("{} wants to send you {what}", request.sender),
+                "Open RustDrop to accept or decline.",
+            );
+        }
+        let _ = self.app.emit("incoming", request);
     }
     fn transfer_changed(&self, update: TransferUpdate) {
-        let _ = self.0.emit("transfer", update);
+        let mut peers = self.peers.lock().unwrap();
+        if let Some(peer) = &update.peer {
+            peers.insert(update.id.clone(), peer.clone());
+        }
+        if update.state == Some(TransferState::Cancelled) {
+            let who = peers
+                .remove(&update.id)
+                .unwrap_or_else(|| "The other device".into());
+            match update.reason.as_deref() {
+                Some("Cancelled by the other device") => self.notify(
+                    "Transfer cancelled",
+                    &format!("{who} cancelled the transfer."),
+                ),
+                Some("You cancelled") => self.notify(
+                    "Transfer cancelled",
+                    &format!("The transfer with {who} was cancelled."),
+                ),
+                _ => {}
+            }
+        }
+        drop(peers);
+        let _ = self.app.emit("transfer", update);
     }
     fn paired(&self, name: String) {
-        let _ = self.0.emit("paired", name);
+        let _ = self.app.emit("paired", name);
     }
     fn failed(&self, message: String) {
-        let _ = self.0.emit("fatal", message);
+        let _ = self.app.emit("fatal", message);
     }
 }
 
@@ -127,12 +189,16 @@ fn reveal(path: PathBuf) -> Answer<()> {
 fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let node = Node::new(
                 config::data_dir().display().to_string(),
                 config::downloads_dir().display().to_string(),
                 None,
-                Arc::new(Events(app.handle().clone())),
+                Arc::new(Events {
+                    app: app.handle().clone(),
+                    peers: Mutex::default(),
+                }),
             )?;
             app.manage(node);
             Ok(())

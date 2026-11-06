@@ -81,6 +81,7 @@ object Core {
             ?.createMulticastLock("rustdrop-discovery")
             ?.apply { setReferenceCounted(false) }
         Files.clearOutgoing(app)
+        Notifications.createChannels(app)
         val name = Settings.Global.getString(app.contentResolver, Settings.Global.DEVICE_NAME)
             ?: android.os.Build.MODEL
         try {
@@ -101,6 +102,7 @@ object Core {
      * Wi-Fi radio for every multicast packet on the network. Transfers keep running over TCP.
      */
     fun setVisible(visible: Boolean) {
+        this.visible = visible
         backgroundPause?.cancel()
         if (visible) {
             multicast?.acquire()
@@ -118,6 +120,9 @@ object Core {
     }
 
     private var backgroundPause: Job? = null
+
+    @Volatile
+    private var visible = false
 
     fun startPairing() {
         pairingMessage.value = null
@@ -178,7 +183,19 @@ object Core {
 
     fun respond(request: IncomingRequest, accept: Boolean) {
         requests.update { q -> q.filter { it.id != request.id } }
+        Notifications.dismissRequest(app, request.id)
         node.respond(request.id, accept)
+    }
+
+    /** Decline from the notification, without opening the app. */
+    fun decline(id: String) {
+        requests.update { q -> q.filter { it.id != id } }
+        Notifications.dismissRequest(app, id)
+        node.respond(id, false)
+    }
+
+    fun cancel(id: String) {
+        if (started) node.cancel(id)
     }
 
     private fun merge(u: TransferUpdate) = transfers.update { list ->
@@ -210,6 +227,7 @@ object Core {
 
         override fun incoming(request: IncomingRequest) {
             requests.update { it + request }
+            if (!visible) Notifications.incoming(app, request)
             scope.launch {
                 delay(REQUEST_TIMEOUT_MS)
                 if (requests.value.any { it.id == request.id }) {
@@ -221,9 +239,17 @@ object Core {
 
         override fun transferChanged(update: TransferUpdate) {
             merge(update)
-            val final = update.state != null && update.state !in ACTIVE
-            if (!final) return
+            val state = update.state ?: return
+            if (state != TransferState.WAITING_FOR_ACCEPT) {
+                // Answered, cancelled by the sender, or expired: the request is gone.
+                requests.update { q -> q.filter { it.id != update.id } }
+                Notifications.dismissRequest(app, update.id)
+            }
+            if (state in ACTIVE) return
             synchronized(outgoingDirs) { outgoingDirs.remove(update.id) }?.deleteRecursively()
+            if (state == TransferState.CANCELLED && update.reason != "Declined" && update.reason != "Not answered in time") {
+                transfers.value.firstOrNull { it.id == update.id }?.let { Notifications.cancelled(app, it) }
+            }
             val saved = update.saved
             if (update.state == TransferState.COMPLETED && saved != null) {
                 scope.launch(Dispatchers.IO) {

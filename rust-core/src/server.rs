@@ -104,8 +104,14 @@ async fn serve(
                 protocol::write(&mut tls, &Message::Pong { nonce }).await?;
             }
             Message::SendRequest { transfer_id, files } => {
-                transfer::receive(&mut tls, &peer, &trusted.name, transfer_id, files, inbox)
-                    .await?;
+                let received =
+                    transfer::receive(&mut tls, &peer, &trusted.name, transfer_id, files, inbox)
+                        .await;
+                match received {
+                    // A cancelled transfer leaves the stream mid-frame: end the session quietly.
+                    Err(e) if e.is::<transfer::Cancelled>() => return Ok(()),
+                    r => r?,
+                }
             }
             Message::PairRequest { code } => {
                 return accept_pairing(&mut tls, &peer, &fp, &code, trust, pairing, inbox).await;
@@ -263,6 +269,7 @@ pub(crate) mod tests {
         pub addr: SocketAddr,
         pub events: mpsc::Receiver<Event>,
         pub pairing: Arc<PairingWindow>,
+        pub inbox: Arc<Inbox>,
     }
 
     /// Starts a listener; returns its address, the receiver's events and its pairing window.
@@ -272,11 +279,12 @@ pub(crate) mod tests {
         let addr = listener.local_addr().unwrap();
         let pairing = Arc::new(PairingWindow::default());
         let inbox = Arc::new(Inbox::new(dest, tx));
-        tokio::spawn(listen(listener, id, trust, inbox, pairing.clone()));
+        tokio::spawn(listen(listener, id, trust, inbox.clone(), pairing.clone()));
         Started {
             addr,
             events,
             pairing,
+            inbox,
         }
     }
 
