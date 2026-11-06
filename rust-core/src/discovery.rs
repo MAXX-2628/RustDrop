@@ -1,7 +1,7 @@
 //! mDNS / DNS-SD discovery on `_rustdrop._tcp.local.`. Announcements are untrusted
 //! input: they only tell us where to connect; identity is proven by TLS.
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, ops::ControlFlow};
 
 use anyhow::Result;
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
@@ -33,13 +33,22 @@ pub fn advertise(daemon: &ServiceDaemon, me: &DeviceInfo, port: u16) -> Result<(
     Ok(())
 }
 
-/// Calls `on_peer` for every resolved, well-formed announcement other than our own.
-pub async fn browse(daemon: &ServiceDaemon, me: Uuid, mut on_peer: impl FnMut(Peer)) -> Result<()> {
+/// Calls `on_peer` for every resolved, well-formed announcement other than our own,
+/// until it returns `Break`.
+pub async fn browse(
+    daemon: &ServiceDaemon,
+    me: Uuid,
+    mut on_peer: impl FnMut(Peer) -> ControlFlow<()>,
+) -> Result<()> {
     let events = daemon.browse(SERVICE)?;
     while let Ok(event) = events.recv_async().await {
         if let ServiceEvent::ServiceResolved(info) = event {
             match parse(&info) {
-                Some(peer) if peer.info.device_id != me => on_peer(peer),
+                Some(peer) if peer.info.device_id != me => {
+                    if on_peer(peer).is_break() {
+                        break;
+                    }
+                }
                 Some(_) => {}
                 None => {
                     tracing::debug!(name = info.get_fullname(), "ignored malformed announcement")

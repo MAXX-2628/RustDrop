@@ -24,11 +24,11 @@ use crate::identity::Identity;
 
 /// SHA-256 of the DER certificate, lowercase hex.
 pub fn fingerprint(cert: &CertificateDer<'_>) -> String {
-    ::ring::digest::digest(&::ring::digest::SHA256, cert)
-        .as_ref()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    hex(::ring::digest::digest(&::ring::digest::SHA256, cert).as_ref())
+}
+
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

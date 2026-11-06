@@ -5,6 +5,7 @@ pub mod identity;
 pub mod protocol;
 pub mod security;
 pub mod server;
+pub mod transfer;
 
 /// Application version, shared with platform front-ends.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

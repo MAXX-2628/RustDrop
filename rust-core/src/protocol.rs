@@ -8,7 +8,8 @@ use uuid::Uuid;
 use crate::PROTOCOL_VERSION;
 
 /// Upper bound for any single control message; peers sending more are dropped.
-pub const MAX_MESSAGE: usize = 64 * 1024;
+/// Sized for a SEND_REQUEST listing `transfer::MAX_FILES` paths.
+pub const MAX_MESSAGE: usize = 1024 * 1024;
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct DeviceInfo {
@@ -18,13 +19,45 @@ pub struct DeviceInfo {
     pub version: u16,
 }
 
+/// One file in a transfer. `path` is relative and `/`-separated; the receiver validates it.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct FileMeta {
+    pub path: String,
+    pub size: u64,
+}
+
+/// After ACCEPT the sender streams each file's raw bytes in order (sizes from SEND_REQUEST),
+/// then sends TRANSFER_COMPLETE with their SHA-256 hashes. The receiver answers
+/// TRANSFER_COMPLETE (verified and saved) or TRANSFER_FAILED.
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Message {
     Hello(DeviceInfo),
     HelloAck(DeviceInfo),
-    Ping { nonce: u64 },
-    Pong { nonce: u64 },
+    Ping {
+        nonce: u64,
+    },
+    Pong {
+        nonce: u64,
+    },
+    SendRequest {
+        transfer_id: Uuid,
+        files: Vec<FileMeta>,
+    },
+    Accept {
+        transfer_id: Uuid,
+    },
+    Decline {
+        transfer_id: Uuid,
+    },
+    TransferComplete {
+        transfer_id: Uuid,
+        sha256: Vec<String>,
+    },
+    TransferFailed {
+        transfer_id: Uuid,
+        reason: String,
+    },
 }
 
 pub async fn write<W: AsyncWrite + Unpin>(w: &mut W, msg: &Message) -> Result<()> {

@@ -46,10 +46,14 @@ The big picture:
   - `security` runs TLS 1.3 only, where both sides present a certificate. A peer is accepted only if its SHA-256 certificate fingerprint is in `trusted.json`; handshake signatures are still verified by rustls. It uses the `ring` crypto backend everywhere, because aws-lc-rs needs extra native tooling.
   - `protocol` frames messages as a u32 BE length plus JSON, with a 64 KiB cap.
   - `discovery` uses `mdns-sd`.
-  - `server` handles HELLO/HELLO_ACK, PING/PONG, connection limits and timeouts.
-- Core modules still to build (ARCHITECTURE §5): QUIC transport (TCP+TLS for now), config, transfer (chunked, SHA-256, bounded buffers), clipboard and device_manager.
+  - `server` handles HELLO/HELLO_ACK, PING/PONG, SEND_REQUEST dispatch, connection limits and timeouts.
+  - `transfer` works in this order: SEND_REQUEST, then ACCEPT/DECLINE bound to the transfer ID (60 s expiry), then the raw file bytes in order, then TRANSFER_COMPLETE with the SHA-256 hashes, then the receiver's verdict.
+    - The receiver validates every remote path with `safe_relative`.
+    - Files are staged in `<dest>/.rustdrop-<id>/` and only moved into place after verification. Existing files are never overwritten; a new file gets a ` (n)` suffix instead.
+    - The UI receives an `Event` stream and approves a request by sending `true` on its `oneshot` channel.
+- Core modules still to build (ARCHITECTURE §5): QUIC transport (TCP+TLS for now), transfer resume, receiver-side cancel, config, clipboard and device_manager.
 - Search the code for `shortcut:` comments; each marks a known gap to close before release, such as the private key stored as a plain file instead of DPAPI/Keystore.
-- Try it with two local instances, each with a different `RUSTDROP_HOME`: run `rustdrop id` in each, then `rustdrop trust <other-fingerprint> <name>` in each, then `rustdrop run` in both.
+- Try it with two local instances, each with a different `RUSTDROP_HOME`: run `rustdrop id` in each, then `rustdrop trust <other-fingerprint> <name>` in each, then `rustdrop run` in both. To test a transfer, run `rustdrop send <name-or-id-prefix> <paths...>` from one instance; setting `RUSTDROP_DOWNLOADS` changes the receiving folder.
 - **Security boundaries:**
   - Discovery data is untrusted and never authenticates a peer.
   - A UUID or device name is never proof of identity; only the certificate fingerprint is.
