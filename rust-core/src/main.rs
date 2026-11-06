@@ -4,6 +4,7 @@ use std::{
 
 use anyhow::{bail, Result};
 use rustdrop_core::{
+    config::{data_dir, downloads_dir},
     discovery,
     identity::Identity,
     security::TrustStore,
@@ -182,24 +183,4 @@ async fn send(
         Outcome::Declined => println!("{name} declined"),
     }
     Ok(())
-}
-
-fn data_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("RUSTDROP_HOME") {
-        return dir.into();
-    }
-    let base = std::env::var_os("APPDATA")
-        .or_else(|| std::env::var_os("HOME"))
-        .unwrap_or_else(|| ".".into());
-    PathBuf::from(base).join("RustDrop")
-}
-
-fn downloads_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("RUSTDROP_DOWNLOADS") {
-        return dir.into();
-    }
-    let home = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .unwrap_or_else(|| ".".into());
-    PathBuf::from(home).join("Downloads").join("RustDrop")
 }

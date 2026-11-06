@@ -31,3 +31,6 @@ android/**/build/
 *.iml
 Thumbs.db
 .DS_Store
+
+# Tauri generated
+windows/src-tauri/gen/

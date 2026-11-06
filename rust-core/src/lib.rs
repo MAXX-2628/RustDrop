@@ -1,5 +1,6 @@
 //! RustDrop shared core: identity, discovery, security and transfer engine.
 
+pub mod config;
 pub mod discovery;
 pub mod identity;
 pub mod protocol;

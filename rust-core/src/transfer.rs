@@ -89,6 +89,18 @@ impl Inbox {
     }
 }
 
+/// Transfer states shown by every UI (ARCHITECTURE.md §11).
+#[derive(serde::Serialize, Clone, Copy, Debug, PartialEq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TransferState {
+    WaitingForAccept,
+    Transferring,
+    Verifying,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Outcome {
     Completed,

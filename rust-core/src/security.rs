@@ -71,6 +71,23 @@ impl TrustStore {
         fs::write(&self.path, serde_json::to_vec_pretty(&*devices)?)?;
         Ok(())
     }
+
+    /// Revokes trust; the device's next handshake is rejected.
+    pub fn remove(&self, fingerprint: &str) -> Result<()> {
+        let mut devices = self.devices.write().unwrap();
+        devices.remove(fingerprint);
+        fs::write(&self.path, serde_json::to_vec_pretty(&*devices)?)?;
+        Ok(())
+    }
+
+    /// (fingerprint, device) pairs.
+    pub fn list(&self) -> Vec<(String, TrustedDevice)> {
+        let devices = self.devices.read().unwrap();
+        devices
+            .iter()
+            .map(|(f, d)| (f.clone(), d.clone()))
+            .collect()
+    }
 }
 
 #[derive(Debug)]

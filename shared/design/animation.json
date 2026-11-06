@@ -1,0 +1,12 @@
+{
+  "durationMs": {
+    "buttonPress": 100,
+    "hover": 120,
+    "cardSelection": 160,
+    "dialog": 200,
+    "deviceAppearance": 220,
+    "transferState": 180,
+    "completion": 300
+  },
+  "easing": { "enter": "cubic-bezier(0.16, 1, 0.3, 1)", "exit": "cubic-bezier(0.7, 0, 0.84, 0)" }
+}

@@ -28,7 +28,20 @@ cargo ndk -t arm64-v8a -t armeabi-v7a -t x86_64 build -p rustdrop-core --lib   #
 cargo audit; cargo outdated                              # dependency security (SECURITY.md §19)
 ```
 
-Later phases, once those projects exist: `pnpm install; pnpm tauri build` in `windows\`, and `.\gradlew assembleDebug` in `android\`.
+Windows app (run these in `windows\`):
+
+```powershell
+pnpm install
+pnpm tauri dev                # Vite dev server + app with hot reload
+pnpm build                    # type-check (tsc) + Vite build only
+pnpm tauri build --no-bundle  # release exe at target\release\rustdrop-windows.exe
+pnpm tauri build              # NSIS installer
+```
+
+- pnpm 12 enforces a minimum release age. Don't add `minimumReleaseAgeExclude`; pin an older version instead. Project rule: npm packages and crates must be at least 14 days old.
+- A running `rustdrop-windows.exe` locks the release build. Close the app before rebuilding it.
+
+Android (later phase): `.\gradlew assembleDebug` in `android\`.
 
 ## Architecture
 
@@ -44,14 +57,23 @@ The big picture:
 - Core modules that exist now:
   - `identity` creates a UUID, a display name and a self-signed rcgen certificate on first run and stores them in the data dir (`RUSTDROP_HOME`, otherwise `%APPDATA%\RustDrop`).
   - `security` runs TLS 1.3 only, where both sides present a certificate. A peer is accepted only if its SHA-256 certificate fingerprint is in `trusted.json`; handshake signatures are still verified by rustls. It uses the `ring` crypto backend everywhere, because aws-lc-rs needs extra native tooling.
-  - `protocol` frames messages as a u32 BE length plus JSON, with a 64 KiB cap.
+  - `protocol` frames messages as a u32 BE length plus JSON, with a 1 MiB cap (sized for a SEND_REQUEST listing 1000 files).
+  - `config` resolves the data and downloads folders (`RUSTDROP_HOME` and `RUSTDROP_DOWNLOADS` override them). The CLI and the apps share it.
   - `discovery` uses `mdns-sd`.
   - `server` handles HELLO/HELLO_ACK, PING/PONG, SEND_REQUEST dispatch, connection limits and timeouts.
   - `transfer` works in this order: SEND_REQUEST, then ACCEPT/DECLINE bound to the transfer ID (60 s expiry), then the raw file bytes in order, then TRANSFER_COMPLETE with the SHA-256 hashes, then the receiver's verdict.
     - The receiver validates every remote path with `safe_relative`.
     - Files are staged in `<dest>/.rustdrop-<id>/` and only moved into place after verification. Existing files are never overwritten; a new file gets a ` (n)` suffix instead.
     - The UI receives an `Event` stream and approves a request by sending `true` on its `oneshot` channel.
-- Core modules still to build (ARCHITECTURE §5): QUIC transport (TCP+TLS for now), transfer resume, receiver-side cancel, config, clipboard and device_manager.
+- Core modules still to build (ARCHITECTURE §5): QUIC transport (TCP+TLS for now), transfer resume, receiver-side cancel, clipboard and device_manager.
+- Windows app: `windows\src-tauri\src\main.rs` is a thin shell over the core.
+  - It runs listen, advertise and browse; then it PINGs each discovered peer to learn its paired status.
+  - It exposes commands (`me`, `peers`, `trusted`, `pair`, `unpair`, `refresh`, `respond`, `send`, `cancel`, `open_downloads`, `reveal`) and emits events (`peers`, `incoming`, `transfer`, `fatal`).
+  - `transfer` events are partial updates; `windows\src\App.tsx` merges their non-null fields by `id`.
+  - Don't name a command after a local variable in `main()`. The generated macro picks up the variable instead (this happened with `trust`).
+  - `reveal` only opens paths inside the downloads folder.
+  - The UI reads its styles from `shared\design\*.json`, applied as CSS variables by `windows\src\tokens.ts`.
+  - Filled buttons use the `primaryButton` colour token, because white text on the brand `#2677F5` is only 4.17:1 contrast.
 - Search the code for `shortcut:` comments; each marks a known gap to close before release, such as the private key stored as a plain file instead of DPAPI/Keystore.
 - Try it with two local instances, each with a different `RUSTDROP_HOME`: run `rustdrop id` in each, then `rustdrop trust <other-fingerprint> <name>` in each, then `rustdrop run` in both. To test a transfer, run `rustdrop send <name-or-id-prefix> <paths...>` from one instance; setting `RUSTDROP_DOWNLOADS` changes the receiving folder.
 - **Security boundaries:**
