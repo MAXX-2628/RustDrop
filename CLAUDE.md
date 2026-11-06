@@ -41,7 +41,15 @@ The big picture:
 - **One shared Rust core (`rust-core\`, crate `rustdrop-core`, lib name `rustdrop_core`) does all networking, security and transfer work.** The platform UIs only show state and send user commands. The core builds as both a `lib` and a `cdylib`, so Android can load it over JNI/UniFFI and Tauri can link it.
   - Windows: Tauri 2 + React/TypeScript in `windows\`.
   - Android: Kotlin + Jetpack Compose in `android\`.
-- Planned core modules (ARCHITECTURE §5): identity, config, protocol, discovery (mDNS `_rustdrop._tcp.local`), server, security (rustls with TLS 1.3, QUIC preferred and TCP+TLS as fallback, certificate-fingerprint trust), transfer (chunked, SHA-256, bounded buffers), clipboard, and device_manager.
+- Core modules that exist now:
+  - `identity` creates a UUID, a display name and a self-signed rcgen certificate on first run and stores them in the data dir (`RUSTDROP_HOME`, otherwise `%APPDATA%\RustDrop`).
+  - `security` runs TLS 1.3 only, where both sides present a certificate. A peer is accepted only if its SHA-256 certificate fingerprint is in `trusted.json`; handshake signatures are still verified by rustls. It uses the `ring` crypto backend everywhere, because aws-lc-rs needs extra native tooling.
+  - `protocol` frames messages as a u32 BE length plus JSON, with a 64 KiB cap.
+  - `discovery` uses `mdns-sd`.
+  - `server` handles HELLO/HELLO_ACK, PING/PONG, connection limits and timeouts.
+- Core modules still to build (ARCHITECTURE §5): QUIC transport (TCP+TLS for now), config, transfer (chunked, SHA-256, bounded buffers), clipboard and device_manager.
+- Search the code for `shortcut:` comments; each marks a known gap to close before release, such as the private key stored as a plain file instead of DPAPI/Keystore.
+- Try it with two local instances, each with a different `RUSTDROP_HOME`: run `rustdrop id` in each, then `rustdrop trust <other-fingerprint> <name>` in each, then `rustdrop run` in both.
 - **Security boundaries:**
   - Discovery data is untrusted and never authenticates a peer.
   - A UUID or device name is never proof of identity; only the certificate fingerprint is.

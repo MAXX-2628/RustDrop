@@ -15,3 +15,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# ring backend everywhere: aws-lc-rs needs extra native tooling for MSVC and the NDK
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "crypto"] }
+ring = "0.17"
+mdns-sd = "0.13"

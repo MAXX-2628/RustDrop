@@ -1,5 +1,11 @@
 //! RustDrop shared core: identity, discovery, security and transfer engine.
 
+pub mod discovery;
+pub mod identity;
+pub mod protocol;
+pub mod security;
+pub mod server;
+
 /// Application version, shared with platform front-ends.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
