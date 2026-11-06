@@ -73,6 +73,7 @@ fn parse(info: &ServiceInfo) -> Option<Peer> {
             .take(16)
             .collect(),
         version: info.get_property_val_str("v")?.parse().ok()?,
+        port: info.get_port(),
     };
     let addrs = info
         .get_addresses()

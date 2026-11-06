@@ -49,7 +49,7 @@ pub async fn listen(
         let (inbox, trust, pairing) = (inbox.clone(), trust.clone(), pairing.clone());
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(e) = serve(acceptor, tcp, me, &inbox, &trust, &pairing).await {
+            if let Err(e) = serve(acceptor, tcp, addr, me, &inbox, &trust, &pairing).await {
                 tracing::warn!(%addr, "session closed: {e:#}");
             }
         });
@@ -59,6 +59,7 @@ pub async fn listen(
 async fn serve(
     acceptor: TlsAcceptor,
     tcp: TcpStream,
+    remote: SocketAddr,
     me: DeviceInfo,
     inbox: &Inbox,
     trust: &TrustStore,
@@ -85,8 +86,11 @@ async fn serve(
         let Message::PairRequest { code } = msg else {
             bail!("untrusted device sent {msg:?}");
         };
-        return accept_pairing(&mut tls, &peer, &fp, &code, trust, pairing, inbox).await;
+        let pairing_ok = accept_pairing(&mut tls, &peer, &fp, &code, trust, pairing, inbox).await;
+        remember(trust, &fp, remote, &peer);
+        return pairing_ok;
     };
+    remember(trust, &fp, remote, &peer);
     tracing::info!(peer = %peer.name, "trusted peer connected");
 
     loop {
@@ -131,6 +135,13 @@ async fn accept_pairing<S: AsyncRead + AsyncWrite + Unpin>(
     protocol::write(stream, &Message::PairAccept).await?;
     inbox.notify(Event::Paired { name }).await;
     Ok(())
+}
+
+/// Saves where a trusted peer listens (its source IP plus the port from its HELLO).
+fn remember(trust: &TrustStore, fp: &str, remote: SocketAddr, peer: &DeviceInfo) {
+    if peer.port != 0 {
+        let _ = trust.set_addr(fp, SocketAddr::new(remote.ip(), peer.port));
+    }
 }
 
 /// A peer-chosen name, made safe to store and display.
@@ -226,6 +237,7 @@ pub async fn pair(
         other => bail!("expected PAIR_ACCEPT, got {other:?}"),
     }
     trust.add(pin, &label(&peer.name))?;
+    trust.set_addr(pin, addr)?;
     let _ = tls.shutdown().await;
     Ok(peer)
 }
@@ -382,5 +394,25 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert_eq!(b_trust.get(&a.fingerprint()).unwrap().name, "Mom's phone");
+    }
+
+    #[test]
+    fn trust_file_from_older_versions_loads_and_keeps_addresses() {
+        let dir = temp_dir("trust");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("trusted.json");
+        let fp = "ab".repeat(32);
+        std::fs::write(&path, format!(r#"{{"{fp}":{{"name":"Laptop"}}}}"#)).unwrap();
+
+        let trust = TrustStore::load(path.clone()).unwrap();
+        assert!(trust.get(&fp).unwrap().addr.is_none());
+        trust
+            .set_addr(&fp, "10.10.21.68:47821".parse().unwrap())
+            .unwrap();
+        trust.add(&fp, "Office PC").unwrap(); // renaming keeps the address
+
+        let again = TrustStore::load(path).unwrap().get(&fp).unwrap();
+        assert_eq!(again.name, "Office PC");
+        assert_eq!(again.addr.as_deref(), Some("10.10.21.68:47821"));
     }
 }

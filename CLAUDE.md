@@ -77,6 +77,10 @@ The big picture:
     - The scanning side (`Node::pair_with_link`, which blocks) pins the fingerprint from the QR.
     - On success both sides add each other to `trusted.json`. A device that's already trusted keeps its existing label.
   - `Node::set_discovery(false)` stops mDNS (with a goodbye packet) but keeps receiving. Android turns it off 30 s after the app leaves the screen and releases the multicast lock at the same time.
+  - Finding devices across subnets (mDNS doesn't cross routers):
+    - The listener prefers port 47821 (`node::DEFAULT_PORT`), and HELLO carries the sender's listening port (`DeviceInfo.port`, 0 from older peers).
+    - The server saves each trusted peer's `ip:port` in `trusted.json` (`TrustedDevice.addr`, optional, so older files still load).
+    - `probe_known` PINGs those saved addresses on start, on discovery resume, on refresh and after pairing, and lists the devices that answer.
   - `transfer` works in this order: SEND_REQUEST, then ACCEPT/DECLINE bound to the transfer ID (60 s expiry), then the raw file bytes in order, then TRANSFER_COMPLETE with the SHA-256 hashes, then the receiver's verdict.
     - The receiver validates every remote path with `safe_relative`.
     - Files are staged in `<dest>/.rustdrop-<id>/` and only moved into place after verification. Existing files are never overwritten; a new file gets a ` (n)` suffix instead.

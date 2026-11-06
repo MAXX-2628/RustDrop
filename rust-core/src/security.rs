@@ -6,6 +6,7 @@
 use std::{
     collections::HashMap,
     fs,
+    net::SocketAddr,
     path::PathBuf,
     sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
@@ -36,6 +37,10 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct TrustedDevice {
     pub name: String,
+    /// Last address ("ip:port") the device was reached at, so it can be found without mDNS
+    /// (for example across Wi-Fi and wired subnets). Absent in files from older versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub addr: Option<String>,
 }
 
 /// Fingerprint -> trusted device, persisted as `trusted.json`.
@@ -69,7 +74,29 @@ impl TrustStore {
             "fingerprint must be 64 hex characters"
         );
         let mut devices = self.devices.write().unwrap();
-        devices.insert(fingerprint, TrustedDevice { name: name.into() });
+        let addr = devices.get(&fingerprint).and_then(|d| d.addr.clone());
+        devices.insert(
+            fingerprint,
+            TrustedDevice {
+                name: name.into(),
+                addr,
+            },
+        );
+        fs::write(&self.path, serde_json::to_vec_pretty(&*devices)?)?;
+        Ok(())
+    }
+
+    /// Remembers where a trusted device listens. Unknown fingerprints are ignored.
+    pub fn set_addr(&self, fingerprint: &str, addr: SocketAddr) -> Result<()> {
+        let mut devices = self.devices.write().unwrap();
+        let Some(device) = devices.get_mut(fingerprint) else {
+            return Ok(());
+        };
+        let addr = addr.to_string();
+        if device.addr.as_deref() == Some(addr.as_str()) {
+            return Ok(());
+        }
+        device.addr = Some(addr);
         fs::write(&self.path, serde_json::to_vec_pretty(&*devices)?)?;
         Ok(())
     }

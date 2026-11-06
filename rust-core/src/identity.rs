@@ -1,6 +1,10 @@
 //! Persistent device identity: UUID, display name, platform and a self-signed TLS certificate.
 
-use std::{fs, path::Path};
+use std::{
+    fs,
+    path::Path,
+    sync::atomic::{AtomicU16, Ordering},
+};
 
 use anyhow::{Context, Result};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -20,6 +24,8 @@ pub struct Identity {
     pub name: String,
     pub cert: CertificateDer<'static>,
     pub key: PrivateKeyDer<'static>,
+    /// Set once the listener is bound; announced in HELLO.
+    pub listen_port: AtomicU16,
 }
 
 impl Identity {
@@ -51,6 +57,7 @@ impl Identity {
             name: stored.name,
             cert: CertificateDer::from(fs::read(&cert)?),
             key: PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(fs::read(&key)?)),
+            listen_port: AtomicU16::new(0),
         })
     }
 
@@ -64,6 +71,7 @@ impl Identity {
             name: self.name.clone(),
             platform: std::env::consts::OS.into(),
             version: PROTOCOL_VERSION,
+            port: self.listen_port.load(Ordering::Relaxed),
         }
     }
 }

@@ -17,6 +17,10 @@ pub struct DeviceInfo {
     pub name: String,
     pub platform: String,
     pub version: u16,
+    /// TCP port this device listens on, so the other side can reach it later without mDNS.
+    /// 0 = unknown (older peers).
+    #[serde(default)]
+    pub port: u16,
 }
 
 /// One file in a transfer. `path` is relative and `/`-separated; the receiver validates it.

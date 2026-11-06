@@ -608,6 +608,7 @@ mod tests {
             name: "peer".into(),
             platform: "test".into(),
             version: crate::PROTOCOL_VERSION,
+            port: 0,
         };
         let files = vec![FileMeta {
             path: "a.txt".into(),

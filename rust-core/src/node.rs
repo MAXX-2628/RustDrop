@@ -173,6 +173,9 @@ pub struct Node {
     _runtime: Runtime,
 }
 
+/// Preferred listening port (falls back to any free port).
+pub const DEFAULT_PORT: u16 = 47821;
+
 fn state(id: Uuid, state: TransferState, reason: Option<&str>) -> TransferUpdate {
     TransferUpdate {
         id: id.to_string(),
@@ -318,6 +321,7 @@ impl Node {
     /// Re-checks whether each nearby device is paired.
     pub fn refresh(&self) {
         self.inner.recheck_all();
+        self.inner.probe_known();
     }
 
     pub fn respond(&self, id: String, accept: bool) {
@@ -468,6 +472,7 @@ impl Node {
         match result {
             Ok(peer) => {
                 self.inner.recheck_all();
+                self.inner.probe_known();
                 Ok(peer.name)
             }
             Err(e) if format!("{e:#}").contains("certificate") => Err(fail(
@@ -506,6 +511,40 @@ impl Inner {
             let _ = discovery::browse(&browsing, node.identity.id, |peer| node.on_peer(peer)).await;
         });
         *slot = Some(Discovery { daemon, task });
+        drop(slot);
+        self.probe_known();
+    }
+
+    /// PINGs every paired device at its remembered address and lists the ones that answer.
+    /// Finds devices mDNS cannot (different subnets, multicast blocked).
+    fn probe_known(self: &Arc<Self>) {
+        for (_, device) in self.trust.list() {
+            let Some(addr) = device.addr.and_then(|a| a.parse::<SocketAddr>().ok()) else {
+                continue;
+            };
+            let node = self.clone();
+            self.rt.spawn(async move {
+                let Ok((info, _)) = server::ping(addr, &node.identity, node.trust.clone()).await
+                else {
+                    return;
+                };
+                let id = info.device_id;
+                {
+                    let mut peers = node.peers.lock().unwrap();
+                    if peers.contains_key(&id) || id == node.identity.id {
+                        return;
+                    }
+                    let info = PeerInfo {
+                        id: id.to_string(),
+                        name: info.name,
+                        platform: info.platform,
+                        trusted: Some(true),
+                    };
+                    peers.insert(id, Peer { info, addr });
+                }
+                node.emit_peers();
+            });
+        }
     }
 
     /// Stops announcing and browsing; the nearby list empties until discovery resumes.
@@ -642,6 +681,7 @@ impl Inner {
             Event::Paired { name } => {
                 self.listener.paired(name);
                 self.recheck_all();
+                self.probe_known();
                 return;
             }
         };
@@ -651,8 +691,14 @@ impl Inner {
 
 async fn run(node: Arc<Inner>) -> anyhow::Result<()> {
     // shortcut: IPv4 only; add an IPv6 listener for IPv6-only networks.
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
-    *node.port.lock().unwrap() = Some(listener.local_addr()?.port());
+    // A fixed port keeps remembered addresses valid across restarts; any free port if it is taken.
+    let listener = match tokio::net::TcpListener::bind(("0.0.0.0", DEFAULT_PORT)).await {
+        Ok(l) => l,
+        Err(_) => tokio::net::TcpListener::bind("0.0.0.0:0").await?,
+    };
+    let port = listener.local_addr()?.port();
+    node.identity.listen_port.store(port, Ordering::Relaxed);
+    *node.port.lock().unwrap() = Some(port);
     let (tx, mut events) = mpsc::channel(32);
     let inbox = Arc::new(Inbox::new(node.downloads.clone(), tx));
     tokio::spawn(server::listen(
@@ -806,6 +852,21 @@ mod tests {
         assert_eq!(b.trusted()[0].fingerprint, a.me().fingerprint);
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert_eq!(*rb.1.lock().unwrap(), vec!["Phone".to_string()]);
+
+        // Without mDNS, each side lists the other at the address it remembered.
+        a.refresh();
+        b.refresh();
+        let listed = |n: &Node, id: &str| {
+            n.peers()
+                .iter()
+                .any(|p| p.id == id && p.trusted == Some(true))
+        };
+        let (a_id, b_id) = (a.me().id, b.me().id);
+        let both = (0..100).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            listed(&a, &b_id) && listed(&b, &a_id)
+        });
+        assert!(both, "a sees b: {:?}, b sees a: {:?}", a.peers(), b.peers());
 
         // Single use: the same QR code does not work twice.
         let c = new_node("Stranger", Arc::new(Recorder::default()));
