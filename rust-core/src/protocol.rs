@@ -28,11 +28,24 @@ pub struct DeviceInfo {
 pub struct FileMeta {
     pub path: String,
     pub size: u64,
+    /// Last-modified time (Unix seconds, 0 = unknown). Only used to match a resumed transfer.
+    #[serde(default)]
+    pub modified: u64,
 }
 
-/// After ACCEPT the sender streams each file's raw bytes in order (sizes from SEND_REQUEST),
-/// then sends TRANSFER_COMPLETE with their SHA-256 hashes. The receiver answers
-/// TRANSFER_COMPLETE (verified and saved) or TRANSFER_FAILED.
+/// The control connection carries SEND_REQUEST, then ACCEPT (with a token and the chunks the
+/// receiver already holds from an earlier, broken attempt) or DECLINE.
+///
+/// File data then flows over up to `transfer::MAX_STREAMS` extra connections to the same
+/// receiver. Each one says DATA_HELLO with the transfer ID and token, then carries chunk frames.
+/// A frame is a u32 chunk index, a u32 length and the bytes. The receiver answers each frame
+/// with the u32 index once the bytes are written. Files are split into
+/// `transfer::CHUNK`-sized chunks, numbered across all files in request order.
+///
+/// When every chunk is acknowledged, the sender sends TRANSFER_COMPLETE with each file's
+/// SHA-256 on the control connection. The receiver re-reads and hashes what it wrote, then
+/// answers TRANSFER_COMPLETE (verified and saved) or TRANSFER_FAILED. Either side may send
+/// CANCEL on the control connection at any time.
 #[derive(Serialize, Deserialize, Debug, PartialEq)]
 #[serde(tag = "type", rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Message {
@@ -54,9 +67,23 @@ pub enum Message {
     },
     Accept {
         transfer_id: Uuid,
+        /// Secret the data connections present in DATA_HELLO (32 hex).
+        token: String,
+        /// Chunks already received in an earlier attempt: a bitset, lowercase hex, bit i of
+        /// byte i/8 (least significant first) = chunk i. Empty = none.
+        #[serde(default)]
+        have: String,
     },
     Decline {
         transfer_id: Uuid,
+        /// Why it was declined automatically (for example, not enough free space). None = the user said no.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// First message on a data connection of an accepted transfer.
+    DataHello {
+        transfer_id: Uuid,
+        token: String,
     },
     TransferComplete {
         transfer_id: Uuid,

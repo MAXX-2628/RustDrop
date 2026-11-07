@@ -67,7 +67,12 @@ async fn serve(
     trust: &TrustStore,
     pairing: &PairingWindow,
 ) -> Result<()> {
-    let mut tls = timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await??;
+    let mut tls = match timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp)).await? {
+        Ok(tls) => tls,
+        // A reachability probe connects and hangs up without a handshake: not an error.
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
     let fp = tls
         .get_ref()
         .1
@@ -111,14 +116,25 @@ async fn serve(
                 inbox.notify(Event::Clipboard { text, from }).await;
             }
             Message::SendRequest { transfer_id, files } => {
-                let received =
-                    transfer::receive(&mut tls, &peer, &trusted.name, transfer_id, files, inbox)
-                        .await;
+                let received = transfer::receive(
+                    &mut tls,
+                    &peer,
+                    &fp,
+                    &trusted.name,
+                    transfer_id,
+                    files,
+                    inbox,
+                )
+                .await;
                 match received {
                     // A cancelled transfer leaves the stream mid-frame: end the session quietly.
                     Err(e) if e.is::<transfer::Cancelled>() => return Ok(()),
                     r => r?,
                 }
+            }
+            // One of the parallel connections carrying an accepted transfer's data.
+            Message::DataHello { transfer_id, token } => {
+                return transfer::receive_stream(&mut tls, &fp, transfer_id, &token, inbox).await;
             }
             Message::PairRequest { code } => {
                 return accept_pairing(&mut tls, &peer, &fp, &code, trust, pairing, inbox).await;

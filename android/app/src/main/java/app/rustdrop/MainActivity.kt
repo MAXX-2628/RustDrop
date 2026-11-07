@@ -29,13 +29,13 @@ class MainActivity : ComponentActivity() {
     private var target: String? = null
 
     private val pickMedia = registerForActivityResult(ActivityResultContracts.PickMultipleVisualMedia()) { uris ->
-        if (uris.isNotEmpty()) prepare { Files.copyUris(this, uris) }
+        if (uris.isNotEmpty()) prepare { Files.openUris(this, uris) }
     }
     private val pickFiles = registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
-        if (uris.isNotEmpty()) prepare { Files.copyUris(this, uris) }
+        if (uris.isNotEmpty()) prepare { Files.openUris(this, uris) }
     }
     private val pickFolder = registerForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
-        if (uri != null) prepare { Files.copyTree(this, uri) }
+        if (uri != null) prepare { Files.openTree(this, uri) }
     }
     private val notifications = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
     private val scanQr = registerForActivityResult(ScanContract()) { result ->
@@ -127,15 +127,15 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** Copies picked content off the main thread, then sends it or stages it for a device. */
-    private fun prepare(copy: suspend () -> List<String>) {
+    /** Opens picked content off the main thread, then sends it or stages it for a device. */
+    private fun prepare(open: suspend () -> List<Outgoing>) {
         val device = target
         target = null
         lifecycleScope.launch {
             Core.preparing.value = true
-            val paths = runCatching { copy() }
+            val items = runCatching { open() }
             Core.preparing.value = false
-            paths.onSuccess { if (device != null) Core.send(device, it) else Core.staged.value = it }
+            items.onSuccess { if (device != null) Core.send(device, it) else Core.stage(it) }
                 .onFailure { Core.notice.value = it.message ?: "Couldn't read the selected files." }
         }
     }
@@ -149,7 +149,7 @@ class MainActivity : ComponentActivity() {
         }
         if (uris.isNotEmpty()) {
             target = null
-            prepare { Files.copyUris(this, uris) }
+            prepare { Files.openUris(this, uris) }
         }
     }
 

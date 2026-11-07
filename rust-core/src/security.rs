@@ -25,6 +25,73 @@ use serde::{Deserialize, Serialize};
 
 use crate::identity::Identity;
 
+/// One DER element: (tag, contents, rest). None if malformed.
+fn der(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+    let (&tag, rest) = input.split_first()?;
+    let (&first, rest) = rest.split_first()?;
+    let (len, rest) = if first < 0x80 {
+        (first as usize, rest)
+    } else {
+        let n = (first & 0x7f) as usize;
+        if n == 0 || n > 4 || rest.len() < n {
+            return None;
+        }
+        let len = rest[..n].iter().fold(0usize, |l, b| (l << 8) | *b as usize);
+        (len, &rest[n..])
+    };
+    (rest.len() >= len).then(|| (tag, &rest[..len], &rest[len..]))
+}
+
+/// UTCTime (YYMMDDHHMMSSZ) or GeneralizedTime (YYYYMMDDHHMMSSZ) as Unix seconds.
+fn der_time(tag: u8, value: &[u8]) -> Option<u64> {
+    let text = std::str::from_utf8(value).ok()?.strip_suffix('Z')?;
+    let digits = |s: &str| s.parse::<u64>().ok();
+    let (year, rest) = match (tag, text.len()) {
+        (0x17, 12) => {
+            let yy = digits(&text[..2])?;
+            (if yy >= 50 { 1900 + yy } else { 2000 + yy }, &text[2..])
+        }
+        (0x18, 14) => (digits(&text[..4])?, &text[4..]),
+        _ => return None,
+    };
+    if !rest.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let field = |i: usize| digits(&rest[i..i + 2]);
+    let (month, day) = (field(0)?, field(2)?);
+    let (h, m, s) = (field(4)?, field(6)?, field(8)?);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || h > 23 || m > 59 || s > 60 {
+        return None;
+    }
+    // Days since 1970-01-01 (Howard Hinnant's days_from_civil).
+    let y = year as i64 - i64::from(month <= 2);
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month as i64 + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + (h * 3600 + m * 60 + s) as i64).ok()
+}
+
+/// The certificate's notBefore and notAfter, as Unix seconds.
+fn validity(cert: &[u8]) -> Option<(u64, u64)> {
+    let (_, certificate, _) = der(cert)?;
+    let (_, tbs, _) = der(certificate)?;
+    let mut rest = tbs;
+    let (tag, _, after) = der(rest)?;
+    if tag == 0xa0 {
+        rest = after; // explicit version
+    }
+    for _ in 0..3 {
+        rest = der(rest)?.2; // serial number, signature algorithm, issuer
+    }
+    let (_, validity, _) = der(rest)?;
+    let (t1, v1, rest) = der(validity)?;
+    let (t2, v2, _) = der(rest)?;
+    Some((der_time(t1, v1)?, der_time(t2, v2)?))
+}
+
 /// SHA-256 of the DER certificate, lowercase hex.
 pub fn fingerprint(cert: &CertificateDer<'_>) -> String {
     hex(::ring::digest::digest(&::ring::digest::SHA256, cert).as_ref())
@@ -130,7 +197,16 @@ struct PinnedVerifier {
 }
 
 impl PinnedVerifier {
-    fn check(&self, cert: &CertificateDer<'_>) -> Result<(), Error> {
+    fn check(&self, cert: &CertificateDer<'_>, now: UnixTime) -> Result<(), Error> {
+        // SECURITY.md §3: never accept expired (or not yet valid) certificates, even pinned ones.
+        match validity(cert) {
+            Some((from, until)) if from <= now.as_secs() && now.as_secs() <= until => {}
+            Some((_, until)) if now.as_secs() > until => {
+                return Err(Error::InvalidCertificate(CertificateError::Expired))
+            }
+            Some(_) => return Err(Error::InvalidCertificate(CertificateError::NotValidYet)),
+            None => return Err(Error::InvalidCertificate(CertificateError::BadEncoding)),
+        }
         let fp = fingerprint(cert);
         let ok = self.trust.get(&fp).is_some()
             || self.pin.as_deref() == Some(fp.as_str())
@@ -176,9 +252,9 @@ impl ServerCertVerifier for PinnedVerifier {
         _intermediates: &[CertificateDer<'_>],
         _server_name: &ServerName<'_>,
         _ocsp_response: &[u8],
-        _now: UnixTime,
+        now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
-        self.check(end_entity)
+        self.check(end_entity, now)
             .map(|_| ServerCertVerified::assertion())
     }
 
@@ -214,9 +290,9 @@ impl ClientCertVerifier for PinnedVerifier {
         &self,
         end_entity: &CertificateDer<'_>,
         _intermediates: &[CertificateDer<'_>],
-        _now: UnixTime,
+        now: UnixTime,
     ) -> Result<ClientCertVerified, Error> {
-        self.check(end_entity)
+        self.check(end_entity, now)
             .map(|_| ClientCertVerified::assertion())
     }
 
@@ -347,5 +423,52 @@ impl PairingWindow {
             *offer = None;
         }
         ok
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_certificate_validity() {
+        assert_eq!(der_time(0x17, b"700101000000Z"), Some(0));
+        assert_eq!(der_time(0x17, b"491231235959Z"), Some(2_524_607_999));
+        assert_eq!(der_time(0x18, b"20240229120000Z"), Some(1_709_208_000));
+        assert_eq!(der_time(0x17, b"701301000000Z"), None);
+        assert_eq!(der_time(0x17, b"7001010000Z"), None);
+
+        // rcgen's default validity (what every RustDrop identity uses) is 1975..4096.
+        let ck = rcgen::generate_simple_self_signed(vec!["rustdrop".into()]).unwrap();
+        let (from, until) = validity(ck.cert.der()).unwrap();
+        assert!(from < 1_000_000_000 && until > 4_000_000_000);
+    }
+
+    #[test]
+    fn expired_certificate_is_rejected_even_when_trusted() {
+        let mut params = rcgen::CertificateParams::new(vec!["rustdrop".into()]).unwrap();
+        params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+        params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        let cert = params
+            .self_signed(&rcgen::KeyPair::generate().unwrap())
+            .unwrap();
+        let der = cert.der();
+
+        let dir = std::env::temp_dir().join(format!("rustdrop-sec-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let trust = Arc::new(TrustStore::load(dir.join("trusted.json")).unwrap());
+        trust.add(&fingerprint(der), "old").unwrap();
+        let verifier = PinnedVerifier {
+            trust,
+            provider: Arc::new(rustls::crypto::ring::default_provider()),
+            pin: None,
+            pairing: None,
+        };
+        let in_2000 = UnixTime::since_unix_epoch(std::time::Duration::from_secs(970_000_000));
+        assert!(verifier.check(der, in_2000).is_ok());
+        assert!(matches!(
+            verifier.check(der, UnixTime::now()),
+            Err(Error::InvalidCertificate(CertificateError::Expired))
+        ));
     }
 }

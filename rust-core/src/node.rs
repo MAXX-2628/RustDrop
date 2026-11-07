@@ -146,7 +146,14 @@ pub trait Listener: Send + Sync {
 struct Discovery {
     daemon: mdns_sd::ServiceDaemon,
     task: JoinHandle<()>,
+    /// Drops devices that stopped answering (see `watch_peers`).
+    watch: JoinHandle<()>,
 }
+
+/// How often listed devices are checked while discovery runs.
+const PEER_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+/// Checks in a row a device may miss before it leaves the list.
+const PEER_MISSES: u32 = 2;
 
 struct Peer {
     info: PeerInfo,
@@ -378,7 +385,56 @@ impl Node {
 
     /// Starts sending files/folders to a nearby paired device. Returns the transfer id.
     pub fn send(&self, device: String, paths: Vec<String>) -> Result<String, NodeError> {
-        if paths.is_empty() {
+        let count = paths.len() as u64;
+        let sources = paths
+            .into_iter()
+            .map(|p| transfer::Source::Path(p.into()))
+            .collect();
+        self.start_send(device, sources, count)
+    }
+
+    /// Like `send`, for files the app already opened (Android content URIs): no copy is made.
+    /// Takes ownership of every `fd`, even on error, and closes them when the transfer ends.
+    /// Each must be a regular, seekable file (several connections read it at once).
+    pub fn send_fds(&self, device: String, files: Vec<FdFile>) -> Result<String, NodeError> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::FromRawFd;
+            let count = files.len() as u64;
+            let sources = files
+                .into_iter()
+                .map(|f| transfer::Source::Open {
+                    name: f.name,
+                    // SAFETY: the caller hands over an open descriptor it no longer uses (detachFd).
+                    file: unsafe { std::fs::File::from_raw_fd(f.fd) },
+                })
+                .collect();
+            self.start_send(device, sources, count)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (device, files);
+            Err(fail("Sending open files is only supported on Android."))
+        }
+    }
+}
+
+/// An already-open file to send, named as the receiver should see it (`/` for folders).
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct FdFile {
+    pub name: String,
+    pub fd: i32,
+}
+
+impl Node {
+    fn start_send(
+        &self,
+        device: String,
+        sources: Vec<transfer::Source>,
+        items: u64,
+    ) -> Result<String, NodeError> {
+        if sources.is_empty() {
             return Err(fail("Choose at least one file or folder."));
         }
         let device = Uuid::parse_str(&device).map_err(|_| fail("Unknown device."))?;
@@ -395,27 +451,31 @@ impl Node {
             id: id.to_string(),
             outgoing: Some(true),
             peer: Some(name),
-            items: Some(paths.len() as u64),
+            items: Some(items),
             done: Some(0),
             state: Some(TransferState::WaitingForAccept),
             ..Default::default()
         });
 
         let node = self.inner.clone();
-        let paths: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
         let (cancel_tx, cancel) = watch::channel(false);
         self.inner.sends.lock().unwrap().insert(id, cancel_tx);
         self.inner.rt.spawn(async move {
             let tick = node.listener.clone();
-            let result =
-                transfer::send(addr, &node.identity, node.trust.clone(), &paths, cancel, {
-                    move |done, total| tick.transfer_changed(progress(id, done, total))
-                })
-                .await;
+            let (identity, trust) = (node.identity.clone(), node.trust.clone());
+            let result = transfer::send(addr, identity, trust, sources, cancel, {
+                move |done, total| tick.transfer_changed(progress(id, done, total))
+            })
+            .await;
             node.sends.lock().unwrap().remove(&id);
             let update = match result {
                 Ok(Outcome::Completed) => state(id, TransferState::Completed, None),
-                Ok(Outcome::Declined) => state(id, TransferState::Cancelled, Some("Declined")),
+                Ok(Outcome::Declined { reason: None }) => {
+                    state(id, TransferState::Cancelled, Some("Declined"))
+                }
+                Ok(Outcome::Declined {
+                    reason: Some(reason),
+                }) => state(id, TransferState::Failed, Some(&reason)),
                 Ok(Outcome::Cancelled { by_peer }) => cancelled_update(id, by_peer),
                 Err(e) => state(id, TransferState::Failed, Some(&friendly(&e))),
             };
@@ -423,7 +483,10 @@ impl Node {
         });
         Ok(id.to_string())
     }
+}
 
+#[cfg_attr(feature = "uniffi", uniffi::export)]
+impl Node {
     /// Cancels a transfer in either direction (an unanswered incoming request is declined).
     /// The other device is told, shows it as cancelled, and discards anything partly received.
     pub fn cancel(&self, id: String) {
@@ -612,9 +675,62 @@ impl Inner {
         let task = self.rt.spawn(async move {
             let _ = discovery::browse(&browsing, node.identity.id, |peer| node.on_peer(peer)).await;
         });
-        *slot = Some(Discovery { daemon, task });
+        let watch = self.rt.spawn(self.clone().watch_peers());
+        *slot = Some(Discovery {
+            daemon,
+            task,
+            watch,
+        });
         drop(slot);
         self.probe_known();
+    }
+
+    /// Removes devices that left the network: every 20 s each listed device gets a plain TCP
+    /// connect (no handshake, so it costs almost nothing), and one that misses two in a row is
+    /// dropped. Paired devices that come back are found again by `probe_known`.
+    async fn watch_peers(self: Arc<Self>) {
+        let mut misses: HashMap<Uuid, u32> = HashMap::new();
+        let mut tick = tokio::time::interval(PEER_CHECK_EVERY);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            let listed: Vec<(Uuid, SocketAddr)> = {
+                let peers = self.peers.lock().unwrap();
+                peers.iter().map(|(id, p)| (*id, p.addr)).collect()
+            };
+            let mut checks = tokio::task::JoinSet::new();
+            for (id, addr) in listed {
+                checks.spawn(async move {
+                    let connect = tokio::net::TcpStream::connect(addr);
+                    let up = tokio::time::timeout(std::time::Duration::from_secs(3), connect)
+                        .await
+                        .is_ok_and(|r| r.is_ok());
+                    (id, up)
+                });
+            }
+            let mut gone = Vec::new();
+            while let Some(Ok((id, up))) = checks.join_next().await {
+                if up {
+                    misses.remove(&id);
+                } else {
+                    let n = misses.entry(id).or_default();
+                    *n += 1;
+                    if *n >= PEER_MISSES {
+                        gone.push(id);
+                    }
+                }
+            }
+            if !gone.is_empty() {
+                let mut peers = self.peers.lock().unwrap();
+                for id in &gone {
+                    peers.remove(id);
+                    misses.remove(id);
+                }
+                drop(peers);
+                self.emit_peers();
+            }
+            self.probe_known();
+        }
     }
 
     /// PINGs every paired device at its remembered address and lists the ones that answer.
@@ -624,6 +740,9 @@ impl Inner {
             let Some(addr) = device.addr.and_then(|a| a.parse::<SocketAddr>().ok()) else {
                 continue;
             };
+            if self.peers.lock().unwrap().values().any(|p| p.addr == addr) {
+                continue; // already listed
+            }
             let node = self.clone();
             self.rt.spawn(async move {
                 let Ok((info, _)) = server::ping(addr, &node.identity, node.trust.clone()).await
@@ -653,6 +772,7 @@ impl Inner {
     fn stop_discovery(&self) {
         if let Some(d) = self.discovery.lock().unwrap().take() {
             d.task.abort();
+            d.watch.abort();
             // Goodbye packet first, so other devices drop us; the daemon runs commands in order.
             let _ = d
                 .daemon
@@ -663,7 +783,6 @@ impl Inner {
         self.emit_peers();
     }
 
-    // shortcut: devices that leave the network stay listed while discovery runs; handle ServiceRemoved for "Unavailable".
     fn on_peer(self: &Arc<Self>, peer: discovery::Peer) -> ControlFlow<()> {
         let Some(addr) = peer.addrs.iter().copied().find(|a| a.is_ipv4()) else {
             return ControlFlow::Continue(());

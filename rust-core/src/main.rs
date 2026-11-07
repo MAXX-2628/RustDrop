@@ -180,9 +180,9 @@ async fn send(
     let (_keep, never_cancel) = tokio::sync::watch::channel(false);
     let outcome = transfer::send(
         addr,
-        &identity,
+        identity,
         trust,
-        &paths,
+        transfer::paths(&paths),
         never_cancel,
         |done, total| {
             print!("\rsending {}%", done * 100 / total.max(1));
@@ -192,7 +192,10 @@ async fn send(
     .await?;
     match outcome {
         Outcome::Completed => println!("\ndone: {name} received and verified everything"),
-        Outcome::Declined => println!("{name} declined"),
+        Outcome::Declined { reason: None } => println!("{name} declined"),
+        Outcome::Declined {
+            reason: Some(reason),
+        } => println!("{name} declined: {reason}"),
         Outcome::Cancelled { .. } => println!("\n{name} cancelled the transfer"),
     }
     Ok(())

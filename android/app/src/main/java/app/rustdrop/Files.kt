@@ -3,59 +3,84 @@ package app.rustdrop
 import android.content.ContentValues
 import android.content.Context
 import android.net.Uri
+import android.os.ParcelFileDescriptor
 import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.webkit.MimeTypeMap
 import androidx.documentfile.provider.DocumentFile
 import java.io.File
-import java.util.UUID
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
 /**
- * The core works with file paths; Android hands out content URIs.
- * Outgoing: copy picked/shared content into cache. Incoming: publish verified files to Downloads.
+ * A picked or shared file, already open. [path] is the name the receiver sees (`/` inside a
+ * folder). The core reads it in place through the descriptor, so nothing is copied first.
+ */
+class Outgoing(val path: String, val pfd: ParcelFileDescriptor)
+
+/**
+ * Android hands out content URIs. Outgoing: open them for the core to read directly.
+ * Incoming: publish verified files to Downloads.
  */
 object Files {
-    private fun outgoingRoot(ctx: Context) = File(ctx.cacheDir, "outgoing")
-
+    /** Cache folder that older versions copied outgoing files into. */
     fun clearOutgoing(ctx: Context) {
-        outgoingRoot(ctx).deleteRecursively()
+        File(ctx.cacheDir, "outgoing").deleteRecursively()
     }
 
-    // shortcut: copies picked files into cache before sending (needs free space equal to their size);
-    // stream straight from the ContentResolver if large videos become a problem.
-    suspend fun copyUris(ctx: Context, uris: List<Uri>): List<String> = withContext(Dispatchers.IO) {
-        val dir = File(outgoingRoot(ctx), UUID.randomUUID().toString()).apply { mkdirs() }
-        uris.map { uri ->
-            val target = unique(dir, safeName(displayName(ctx, uri)))
-            ctx.contentResolver.openInputStream(uri).use { input ->
-                requireNotNull(input) { "Couldn't open a selected file." }
-                target.outputStream().use { input.copyTo(it) }
-            }
-            target.path
+    fun close(items: List<Outgoing>) = items.forEach { runCatching { it.pfd.close() } }
+
+    suspend fun openUris(ctx: Context, uris: List<Uri>): List<Outgoing> = withContext(Dispatchers.IO) {
+        val names = mutableSetOf<String>()
+        collecting { list ->
+            for (uri in uris) list += open(ctx, uri, uniqueName(names, safeName(displayName(ctx, uri))))
         }
     }
 
-    /** Copies a picked folder (Storage Access Framework tree), keeping its structure. */
-    suspend fun copyTree(ctx: Context, tree: Uri): List<String> = withContext(Dispatchers.IO) {
+    /** A picked folder (Storage Access Framework tree), keeping its structure. */
+    suspend fun openTree(ctx: Context, tree: Uri): List<Outgoing> = withContext(Dispatchers.IO) {
         val root = requireNotNull(DocumentFile.fromTreeUri(ctx, tree)) { "Couldn't open that folder." }
-        val dir = File(outgoingRoot(ctx), UUID.randomUUID().toString())
-        val top = File(dir, safeName(root.name ?: "Folder"))
-        copyDocument(ctx, root, top)
-        listOf(top.path)
+        collecting { list -> walk(ctx, root, safeName(root.name ?: "Folder"), list) }
     }
 
-    private fun copyDocument(ctx: Context, doc: DocumentFile, target: File) {
+    private fun walk(ctx: Context, doc: DocumentFile, path: String, list: MutableList<Outgoing>) {
         if (doc.isDirectory) {
-            target.mkdirs()
+            val names = mutableSetOf<String>()
             for (child in doc.listFiles()) {
-                copyDocument(ctx, child, unique(target, safeName(child.name ?: "file")))
+                walk(ctx, child, "$path/${uniqueName(names, safeName(child.name ?: "file"))}", list)
             }
         } else if (doc.isFile) {
-            ctx.contentResolver.openInputStream(doc.uri)?.use { input ->
-                target.outputStream().use { input.copyTo(it) }
+            list += open(ctx, doc.uri, path)
+        }
+    }
+
+    /** Closes whatever was opened if a later file fails, so no descriptor leaks. */
+    private inline fun collecting(block: (MutableList<Outgoing>) -> Unit): List<Outgoing> {
+        val list = mutableListOf<Outgoing>()
+        try {
+            block(list)
+        } catch (e: Throwable) {
+            close(list)
+            throw e
+        }
+        return list
+    }
+
+    private fun open(ctx: Context, uri: Uri, path: String): Outgoing {
+        val pfd = requireNotNull(ctx.contentResolver.openFileDescriptor(uri, "r")) { "Couldn't open a selected file." }
+        // statSize is -1 unless this is a regular file (the core reads it at several offsets at once).
+        if (pfd.statSize >= 0) return Outgoing(path, pfd)
+        pfd.close()
+        // A provider that only streams (a pipe): copy this one file to cache and send the copy.
+        val tmp = File.createTempFile("outgoing", null, ctx.cacheDir)
+        try {
+            ctx.contentResolver.openInputStream(uri).use { input ->
+                requireNotNull(input) { "Couldn't open a selected file." }
+                tmp.outputStream().use { input.copyTo(it) }
             }
+            return Outgoing(path, ParcelFileDescriptor.open(tmp, ParcelFileDescriptor.MODE_READ_ONLY))
+        } finally {
+            tmp.delete() // the open descriptor keeps the data readable until it is closed
         }
     }
 
@@ -107,12 +132,13 @@ object Files {
     private fun safeName(name: String): String =
         name.replace('/', '_').replace('\\', '_').trim().trimEnd('.').ifEmpty { "file" }.take(200)
 
-    private fun unique(dir: File, name: String): File {
-        var candidate = File(dir, name)
+    /** The receiver rejects names that differ only in case, so `a.jpg` and `A.JPG` become `a.jpg`, `A (1).JPG`. */
+    private fun uniqueName(taken: MutableSet<String>, name: String): String {
+        var candidate = name
         var n = 1
-        while (candidate.exists()) {
+        while (!taken.add(candidate.lowercase())) {
             val dot = name.lastIndexOf('.').takeIf { it > 0 } ?: name.length
-            candidate = File(dir, "${name.substring(0, dot)} ($n)${name.substring(dot)}")
+            candidate = "${name.substring(0, dot)} ($n)${name.substring(dot)}"
             n++
         }
         return candidate

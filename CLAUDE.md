@@ -81,19 +81,32 @@ The big picture:
     - The listener prefers port 47821 (`node::DEFAULT_PORT`), and HELLO carries the sender's listening port (`DeviceInfo.port`, 0 from older peers).
     - The server saves each trusted peer's `ip:port` in `trusted.json` (`TrustedDevice.addr`, optional, so older files still load).
     - `probe_known` PINGs those saved addresses on start, on discovery resume, on refresh and after pairing, and lists the devices that answer.
-  - `transfer` works in this order: SEND_REQUEST, then ACCEPT/DECLINE bound to the transfer ID (60 s expiry), then the raw file bytes in order, then TRANSFER_COMPLETE with the SHA-256 hashes, then the receiver's verdict.
-    - Protocol v2: file data travels as frames (u32 length + up to 64 KiB). A length of `u32::MAX` means the sender cancelled. The sender splits the stream, so the receiver's CANCEL message can arrive mid-transfer.
-    - `Node::cancel(id)` works in both directions; for an unanswered request it means Decline. The other side gets "Cancelled by the other device".
-    - A receiver that cancels drains the stream before closing; otherwise the OS resets the connection and the sender never sees the CANCEL.
-    - The receiver validates every remote path with `safe_relative`.
-    - Files are staged in `<dest>/.rustdrop-<id>/` and only moved into place after verification. Existing files are never overwritten; a new file gets a ` (n)` suffix instead.
+  - `transfer` (protocol v3) works in this order:
+    1. On the control connection: SEND_REQUEST, then ACCEPT or DECLINE, bound to the transfer ID (60 s expiry). ACCEPT carries a random token and a hex bitset of chunks the receiver already holds. DECLINE may carry a reason (for example, not enough free space).
+    2. The sender opens up to `MAX_STREAMS` (4) data connections. Each one sends DATA_HELLO (transfer ID + token), then chunk frames: u32 index, u32 length, then the bytes.
+       - Files are cut into `CHUNK` (1 MiB) pieces, numbered across all files (`Layout`).
+       - The receiver writes each chunk at its offset (`disk::write_all_at`) and acknowledges it with its u32 index.
+       - A broken data connection reconnects up to 3 times; its unacknowledged chunk goes back on the shared queue.
+    3. The sender hashes every file in the background. Once all chunks are acknowledged, it sends TRANSFER_COMPLETE with the SHA-256 hashes.
+    4. The receiver re-reads and hashes what it wrote, then answers TRANSFER_COMPLETE or TRANSFER_FAILED.
+    - A data connection is accepted only from the same certificate fingerprint as the request, with the right token (compared in constant time), and at most 8 at once per transfer. Every chunk index and length is checked against the layout.
+    - `Node::cancel(id)` works in both directions: the CANCEL goes on the control connection, which is otherwise quiet while data flows. For an unanswered request it means Decline. The other side gets "Cancelled by the other device".
+    - The receiver validates every remote path with `safe_relative` and checks free space (`disk::available_space`, with a 64 MiB margin) before asking the user.
+    - Staging: files land in `<dest>/.rustdrop-<key>/files/`. `key` is a hash of the sender's fingerprint plus each file's path, size and modified time.
+      - Every 5 s the receiver syncs the files and saves its chunk bitset to `chunks`.
+      - A transfer that breaks keeps the folder, so sending the same files again resumes it.
+      - A cancel or a failed hash check deletes the folder. Folders untouched for 7 days are deleted.
+      - Files are only moved into place after verification. Existing files are never overwritten; a new file gets a ` (n)` suffix instead.
     - The UI receives an `Event` stream and approves a request by sending `true` on its `oneshot` channel.
+    - `cargo test --release -p rustdrop-core throughput -- --ignored --nocapture` measures loopback speed (about 500 MB/s on the dev PC).
+  - `security` also rejects expired or not-yet-valid certificates, even pinned ones. `validity()` is a small DER reader; rcgen's default validity runs from 1975 to 4096.
+  - `Node` drops listed devices that miss two TCP connect checks in a row (every 20 s while discovery runs). `serve` treats a handshake-less hang-up as a probe, not an error.
 - Clipboard sync (`Node::set_clipboard_sync`, saved in `settings.json`, off by default):
   - Text only, at most 64 KiB, sent as a CLIPBOARD message to paired devices that are currently listed.
   - A SHA-256 of the last text (`remember_clip`) stops a received text from being sent back.
   - Windows polls the clipboard every 500 ms and writes received text with `exclude_from_history` (kept out of Win+V and cloud clipboard).
   - Android can read the clipboard only while the app has focus; received text is applied at any time.
-- Core modules still to build (ARCHITECTURE §5): QUIC transport (TCP+TLS for now), transfer resume and device_manager.
+- Core modules still to build (ARCHITECTURE §5): QUIC transport (TCP+TLS for now) and device_manager.
 - `node` holds the app logic both platforms share.
   - `Node::new(data_dir, downloads_dir, device_name, listener)` owns a tokio runtime. It runs listen, advertise and browse, then PINGs each discovered peer to learn whether it's paired.
   - It exposes `me`, `peers`, `trusted`, `pair`, `unpair`, `refresh`, `respond`, `send`, `cancel`, `set_discovery`, `start_pairing`, `stop_pairing`, `pair_with_link`, `clipboard_sync`, `set_clipboard_sync` and `clipboard_changed`.
@@ -107,7 +120,7 @@ The big picture:
 - Android app: `android\app\src\main\java\app\rustdrop\`.
   - `Core` (in `RustDropApp.kt`) creates the `Node` and exposes `StateFlow`s to Compose.
   - The `Application` holds a multicast lock; without it Android drops mDNS packets.
-  - `Files.kt` copies picked or shared content URIs into cache before sending. Received files are verified in app storage, then published to `Download/RustDrop` through MediaStore; a local copy is deleted only after it's fully written.
+  - `Files.kt` opens picked or shared content URIs as `ParcelFileDescriptor`s, and `Core.send` hands duplicates to `Node::send_fds`, so nothing is copied. Only a provider that streams (`statSize` < 0, a pipe) gets copied to cache, and that copy's name is deleted at once. Received files are verified in app storage, then published to `Download/RustDrop` through MediaStore; a local copy is deleted only after it's fully written.
   - `TransferService` is a dataSync foreground service that runs while any transfer is active.
   - `Notifications.kt`: the ongoing transfer notification has a Cancel action and is a Live Update (`ProgressStyle` + `EXTRA_REQUEST_PROMOTED_ONGOING`) on API 36+. A request that arrives in the background gets a notification with Decline. `ActionReceiver` handles both buttons.
   - `TransferIsland` (`ui\Screens.kt`) is the in-app "dynamic island": the accept prompt, a progress pill (tap to expand, with Cancel), then the result for 3 s. It always uses the dark palette (`LocalIsland`).
@@ -128,8 +141,8 @@ The big picture:
   - Clipboard sync is opt-in, trusted devices only, and its contents are never logged.
 - Protocol messages are versioned and length-prefixed (`PROTOCOL_VERSION` in `rust-core\src\lib.rs`). Transfer states (IDLE … CANCELLED) must stay identical in the core and both UIs.
 - Shared design tokens go in `shared\design\*.json`, and both platforms use the same values. Never hardcode colours in components.
-- Status: discovery, QR and fingerprint pairing, cross-subnet probing, file transfer with cancel from either side, notifications and clipboard sync all work.
-- Backlog: key storage in DPAPI/Keystore, certificate expiry check, free-space check, transfer resume, unavailable-device handling, IPv6/QUIC, tray/autostart and release signing.
+- Status: discovery, QR and fingerprint pairing, cross-subnet probing, parallel chunked transfer with resume, cancel from either side, free-space and certificate-expiry checks, offline-device removal, notifications and clipboard sync all work.
+- Backlog: key storage in DPAPI/Keystore, IPv6/QUIC, tray/autostart and release signing.
 
 ## Git
 

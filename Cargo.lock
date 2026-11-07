@@ -3172,6 +3172,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "if-addrs",
+ "libc",
  "mdns-sd",
  "qrcode",
  "rcgen",
@@ -3185,6 +3186,7 @@ dependencies = [
  "tracing-subscriber",
  "uniffi",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

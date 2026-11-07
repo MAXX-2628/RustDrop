@@ -125,7 +125,7 @@ enum class PickKind { Media, Files, Folder }
 /** Everything the UI can ask for; implemented by MainActivity. */
 class Actions(
     val pick: (PickKind, String?) -> Unit,
-    val send: (String, List<String>) -> Unit,
+    val send: (String, List<app.rustdrop.Outgoing>) -> Unit,
     val clearStaged: () -> Unit,
     val refresh: () -> Unit,
     val cancel: (String) -> Unit,
@@ -209,7 +209,7 @@ fun RustDropUi(actions: Actions) {
 private fun HomeScreen(
     me: Me?,
     peers: List<PeerInfo>,
-    staged: List<String>,
+    staged: List<app.rustdrop.Outgoing>,
     preparing: Boolean,
     notice: String?,
     transfers: List<Transfer>,

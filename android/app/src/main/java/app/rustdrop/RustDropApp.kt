@@ -8,6 +8,7 @@ import android.net.wifi.WifiManager
 import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
+import app.rustdrop.core.FdFile
 import app.rustdrop.core.IncomingRequest
 import app.rustdrop.core.Listener
 import app.rustdrop.core.Me
@@ -65,8 +66,8 @@ object Core {
     val transfers = MutableStateFlow<List<Transfer>>(emptyList())
     val requests = MutableStateFlow<List<IncomingRequest>>(emptyList())
     val fatal = MutableStateFlow<String?>(null)
-    /** Files copied from pickers or the share sheet, waiting for a device. */
-    val staged = MutableStateFlow<List<String>>(emptyList())
+    /** Files opened from pickers or the share sheet, waiting for a device. */
+    val staged = MutableStateFlow<List<Outgoing>>(emptyList())
     val preparing = MutableStateFlow(false)
     val notice = MutableStateFlow<String?>(null)
 
@@ -78,7 +79,6 @@ object Core {
     val clipboardSync = MutableStateFlow(false)
     val clipboardFrom = MutableStateFlow<String?>(null)
 
-    private val outgoingDirs = mutableMapOf<String, File>()
     private val received get() = File(app.filesDir, "received")
     private var multicast: WifiManager.MulticastLock? = null
     private val main = Handler(Looper.getMainLooper())
@@ -162,21 +162,29 @@ object Core {
         }
     }
 
-    fun send(device: String, paths: List<String>) {
+    /**
+     * Sends opened files. The core gets duplicates of the descriptors and closes them when the
+     * transfer ends; ours are closed on success, or kept staged so the user can pick a device again.
+     */
+    fun send(device: String, items: List<Outgoing>) {
         try {
-            val id = node.send(device, paths)
-            File(paths.first()).parentFile?.let { synchronized(outgoingDirs) { outgoingDirs[id] = it } }
-            staged.value = emptyList()
+            node.sendFds(device, items.map { FdFile(it.path, it.pfd.dup().detachFd()) })
+            if (staged.value === items) clearStaged() else Files.close(items)
             notice.value = null
-        } catch (e: NodeException) {
-            notice.value = e.message
+        } catch (e: Exception) {
+            if (e !is NodeException && e !is java.io.IOException) throw e
+            notice.value = e.message ?: "Couldn't send the files."
+            if (staged.value !== items) stage(items)
         }
     }
 
-    fun clearStaged() {
-        staged.value.firstOrNull()?.let { File(it).parentFile?.deleteRecursively() }
-        staged.value = emptyList()
+    /** Holds picked files until a device is chosen, closing any that were staged before. */
+    fun stage(items: List<Outgoing>) {
+        Files.close(staged.value)
+        staged.value = items
     }
+
+    fun clearStaged() = stage(emptyList())
 
     fun pair(fingerprint: String, name: String): String? = try {
         node.pair(fingerprint, name)
@@ -268,7 +276,6 @@ object Core {
                 Notifications.dismissRequest(app, update.id)
             }
             if (state in ACTIVE) return
-            synchronized(outgoingDirs) { outgoingDirs.remove(update.id) }?.deleteRecursively()
             if (state == TransferState.CANCELLED && update.reason != "Declined" && update.reason != "Not answered in time") {
                 transfers.value.firstOrNull { it.id == update.id }?.let { Notifications.cancelled(app, it) }
             }
