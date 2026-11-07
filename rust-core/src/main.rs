@@ -7,6 +7,7 @@ use rustdrop_core::{
     config::{data_dir, downloads_dir},
     discovery,
     identity::Identity,
+    node,
     security::TrustStore,
     server,
     transfer::{self, Event, Inbox, Outcome},
@@ -58,8 +59,15 @@ async fn main() -> Result<()> {
 
 async fn run(identity: Arc<Identity>, trust: Arc<TrustStore>) -> Result<()> {
     // shortcut: IPv4 only; add an IPv6 listener when testing on IPv6-only networks.
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:0").await?;
+    // Same port as the apps, so paired devices that saved this address can reach it again.
+    let listener = match tokio::net::TcpListener::bind(("0.0.0.0", node::DEFAULT_PORT)).await {
+        Ok(l) => l,
+        Err(_) => tokio::net::TcpListener::bind("0.0.0.0:0").await?,
+    };
     let port = listener.local_addr()?.port();
+    identity
+        .listen_port
+        .store(port, std::sync::atomic::Ordering::Relaxed); // announced in HELLO
     let (tx, events) = mpsc::channel(16);
     let inbox = Arc::new(Inbox::new(downloads_dir(), tx));
     tokio::spawn(server::listen(

@@ -511,7 +511,7 @@ impl Node {
             clipboard_sync: enabled,
         };
         let bytes = serde_json::to_vec_pretty(&settings).map_err(|e| fail(e.to_string()))?;
-        std::fs::write(&self.inner.settings_path, bytes)
+        crate::disk::write_atomic(&self.inner.settings_path, &bytes)
             .map_err(|e| fail(format!("Couldn't save the setting: {e}")))?;
         self.inner.clipboard_sync.store(enabled, Ordering::SeqCst);
         if !enabled {
@@ -882,7 +882,11 @@ impl Inner {
                     state: Some(TransferState::WaitingForAccept),
                     ..Default::default()
                 });
-                self.pending.lock().unwrap().insert(id, req.decision);
+                let mut pending = self.pending.lock().unwrap();
+                // Requests that expired unanswered: their receiver side is gone.
+                pending.retain(|_, tx| !tx.is_closed());
+                pending.insert(id, req.decision);
+                drop(pending);
                 self.listener.incoming(view);
                 return;
             }

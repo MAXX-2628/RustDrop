@@ -149,7 +149,7 @@ impl TrustStore {
                 addr,
             },
         );
-        fs::write(&self.path, serde_json::to_vec_pretty(&*devices)?)?;
+        crate::disk::write_atomic(&self.path, &serde_json::to_vec_pretty(&*devices)?)?;
         Ok(())
     }
 
@@ -164,7 +164,7 @@ impl TrustStore {
             return Ok(());
         }
         device.addr = Some(addr);
-        fs::write(&self.path, serde_json::to_vec_pretty(&*devices)?)?;
+        crate::disk::write_atomic(&self.path, &serde_json::to_vec_pretty(&*devices)?)?;
         Ok(())
     }
 
@@ -172,7 +172,7 @@ impl TrustStore {
     pub fn remove(&self, fingerprint: &str) -> Result<()> {
         let mut devices = self.devices.write().unwrap();
         devices.remove(fingerprint);
-        fs::write(&self.path, serde_json::to_vec_pretty(&*devices)?)?;
+        crate::disk::write_atomic(&self.path, &serde_json::to_vec_pretty(&*devices)?)?;
         Ok(())
     }
 

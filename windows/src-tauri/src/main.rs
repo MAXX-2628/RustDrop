@@ -73,6 +73,12 @@ impl Listener for Events {
         if let Some(peer) = &update.peer {
             peers.insert(update.id.clone(), peer.clone());
         }
+        if matches!(
+            update.state,
+            Some(TransferState::Completed | TransferState::Failed)
+        ) {
+            peers.remove(&update.id); // finished: the name is only needed for a cancel notice
+        }
         if update.state == Some(TransferState::Cancelled) {
             let who = peers
                 .remove(&update.id)

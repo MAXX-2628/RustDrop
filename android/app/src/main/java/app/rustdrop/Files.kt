@@ -23,6 +23,7 @@ class Outgoing(val path: String, val pfd: ParcelFileDescriptor)
  * Incoming: publish verified files to Downloads.
  */
 object Files {
+    private const val MAX_FILES = 1000
     /** Cache folder that older versions copied outgoing files into. */
     fun clearOutgoing(ctx: Context) {
         File(ctx.cacheDir, "outgoing").deleteRecursively()
@@ -50,6 +51,8 @@ object Files {
                 walk(ctx, child, "$path/${uniqueName(names, safeName(child.name ?: "file"))}", list)
             }
         } else if (doc.isFile) {
+            // Same limit as the core (transfer::MAX_FILES); stop before opening thousands of files.
+            require(list.size < MAX_FILES) { "That folder has more than $MAX_FILES files. Choose a smaller folder." }
             list += open(ctx, doc.uri, path)
         }
     }

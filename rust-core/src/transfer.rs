@@ -123,6 +123,9 @@ pub struct Inbox {
     active: Mutex<HashMap<Uuid, Arc<Active>>>,
     /// Staging folders in use, so two transfers of the same files never share one.
     busy: Mutex<HashSet<String>>,
+    /// Test hook: drop the next data connection after reading a chunk, before acknowledging it.
+    #[cfg(test)]
+    pub(crate) drop_next_stream: AtomicBool,
 }
 
 impl Inbox {
@@ -134,6 +137,8 @@ impl Inbox {
             cancels: Mutex::default(),
             active: Mutex::default(),
             busy: Mutex::default(),
+            #[cfg(test)]
+            drop_next_stream: AtomicBool::new(false),
         }
     }
 
@@ -471,9 +476,7 @@ fn checkpoint(active: &Active, list: &Path) -> io::Result<()> {
         }
     }
     let have = active.have.lock().unwrap().clone();
-    let tmp = list.with_extension("tmp");
-    std::fs::write(&tmp, have)?;
-    std::fs::rename(tmp, list)
+    disk::write_atomic(list, &have)
 }
 
 /// Deletes staging folders of broken transfers nobody resumed for a week.
@@ -598,7 +601,11 @@ async fn run_receive<S: AsyncRead + AsyncWrite + Unpin>(
 
     // Not enough room: decline before bothering the user, and say why on both devices.
     fs::create_dir_all(&inbox.dest).await?;
-    let need = job.total - layout.bytes_in(&have);
+    let mut need = job.total - layout.bytes_in(&have);
+    if cfg!(target_os = "android") {
+        // The app then copies each file into Downloads on the same storage before deleting its own.
+        need += job.sizes.iter().max().copied().unwrap_or(0);
+    }
     let free = disk::available_space(&inbox.dest).unwrap_or(u64::MAX);
     if free < need.saturating_add(SPACE_MARGIN) {
         let (need, free) = (human(need), human(free.saturating_sub(SPACE_MARGIN)));
@@ -932,6 +939,10 @@ pub(crate) async fn receive_stream<S: AsyncRead + AsyncWrite + Unpin>(
             let (f, offset, want) = active.layout.locate(index).context("bad chunk index")?;
             ensure!(len == want, "bad chunk length {len} for chunk {index}");
             timeout(IDLE_TIMEOUT, stream.read_exact(&mut buf[..len])).await??;
+            #[cfg(test)]
+            if inbox.drop_next_stream.swap(false, Ordering::SeqCst) {
+                bail!("test: connection dropped");
+            }
 
             let file = active.file(f)?;
             let data = std::mem::take(&mut buf);
@@ -1630,6 +1641,35 @@ mod tests {
             .file_name()
             .to_string_lossy()
             .starts_with(".rustdrop-")));
+    }
+
+    #[tokio::test]
+    async fn broken_data_connection_is_retried_and_file_arrives_intact() {
+        let ((a, a_trust), (b, b_trust)) = trusted_pair();
+        let dest = temp_dir("dest");
+        let s = start(b, b_trust, dest.clone()).await;
+        s.inbox.drop_next_stream.store(true, Ordering::SeqCst);
+        auto_answer(s.events, true);
+        let path = big_file("src", 8);
+
+        let outcome = send(
+            s.addr,
+            a,
+            a_trust,
+            paths(std::slice::from_ref(&path)),
+            never(),
+            |_, _| {},
+        )
+        .await;
+        assert_eq!(outcome.unwrap(), Outcome::Completed);
+        assert!(
+            !s.inbox.drop_next_stream.load(Ordering::SeqCst),
+            "a connection was dropped"
+        );
+        assert_eq!(
+            std::fs::read(dest.join("big.bin")).unwrap(),
+            std::fs::read(path).unwrap()
+        );
     }
 
     #[tokio::test]

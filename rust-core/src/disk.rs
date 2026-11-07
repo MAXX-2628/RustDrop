@@ -8,6 +8,13 @@ pub fn available_space(dir: &Path) -> io::Result<u64> {
     imp::available_space(dir)
 }
 
+/// Replaces `path` with `bytes` all at once: a crash leaves the old or the new file, never half of one.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(tmp, path)
+}
+
 /// Writes all of `buf` at `offset`, without moving any shared file cursor.
 pub fn write_all_at(file: &File, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
     while !buf.is_empty() {
@@ -118,6 +125,12 @@ mod tests {
         read_exact_at(&file, &mut buf, 0).unwrap();
         assert_eq!(&buf, b"helloworld");
         assert!(read_exact_at(&file, &mut buf, 5).is_err());
+
+        let json = dir.join("trusted.json");
+        write_atomic(&json, b"old").unwrap();
+        write_atomic(&json, b"new").unwrap();
+        assert_eq!(std::fs::read(&json).unwrap(), b"new");
+        assert!(!json.with_extension("tmp").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
