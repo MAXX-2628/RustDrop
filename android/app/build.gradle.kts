@@ -35,8 +35,21 @@ android {
         assets.directories += File(repo, "shared").path // design tokens: assets/design/*.json
     }
 
+    // Release signing key: Tools/signing (git-ignored, never committed). Without it the release APK is unsigned.
+    val signing = File(repo, "Tools/signing/keystore.properties")
+    if (signing.exists()) {
+        val p = signing.readLines().filter { "=" in it }.associate { it.substringBefore("=").trim() to it.substringAfter("=").trim() }
+        signingConfigs.create("release") {
+            storeFile = File(p.getValue("storeFile"))
+            storePassword = p.getValue("storePassword")
+            keyAlias = p.getValue("keyAlias")
+            keyPassword = p.getValue("keyPassword")
+        }
+    }
+
     buildTypes {
         release {
+            signingConfigs.findByName("release")?.let { signingConfig = it }
             isMinifyEnabled = true
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
