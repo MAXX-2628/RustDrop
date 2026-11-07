@@ -88,21 +88,29 @@ The big picture:
     - The receiver validates every remote path with `safe_relative`.
     - Files are staged in `<dest>/.rustdrop-<id>/` and only moved into place after verification. Existing files are never overwritten; a new file gets a ` (n)` suffix instead.
     - The UI receives an `Event` stream and approves a request by sending `true` on its `oneshot` channel.
-- Core modules still to build (ARCHITECTURE §5): QUIC transport (TCP+TLS for now), transfer resume, receiver-side cancel, clipboard and device_manager.
+- Clipboard sync (`Node::set_clipboard_sync`, saved in `settings.json`, off by default):
+  - Text only, at most 64 KiB, sent as a CLIPBOARD message to paired devices that are currently listed.
+  - A SHA-256 of the last text (`remember_clip`) stops a received text from being sent back.
+  - Windows polls the clipboard every 500 ms and writes received text with `exclude_from_history` (kept out of Win+V and cloud clipboard).
+  - Android can read the clipboard only while the app has focus; received text is applied at any time.
+- Core modules still to build (ARCHITECTURE §5): QUIC transport (TCP+TLS for now), transfer resume and device_manager.
 - `node` holds the app logic both platforms share.
   - `Node::new(data_dir, downloads_dir, device_name, listener)` owns a tokio runtime. It runs listen, advertise and browse, then PINGs each discovered peer to learn whether it's paired.
-  - It exposes `me`, `peers`, `trusted`, `pair`, `unpair`, `refresh`, `respond`, `send` and `cancel`.
-  - It reports back through the `Listener` trait: `peers_changed`, `incoming`, `transfer_changed` and `failed`.
+  - It exposes `me`, `peers`, `trusted`, `pair`, `unpair`, `refresh`, `respond`, `send`, `cancel`, `set_discovery`, `start_pairing`, `stop_pairing`, `pair_with_link`, `clipboard_sync`, `set_clipboard_sync` and `clipboard_changed`.
+  - It reports back through the `Listener` trait: `peers_changed`, `incoming`, `transfer_changed`, `clipboard_received`, `paired` and `failed`.
   - `TransferUpdate` is a partial update; UIs merge its non-null fields by `id`.
   - With `--features uniffi`, the same types are exported to Kotlin in package `app.rustdrop.core`. Settings are in `rust-core\uniffi.toml`, including `android = true`. `NodeError` is a `flat_error`, so Kotlin sees its Display text.
 - Windows app: `windows\src-tauri\src\main.rs` is a thin Tauri shell over `node`.
   - Its `Listener` emits webview events (`peers`, `incoming`, `transfer`, `fatal`), and each command calls the matching `Node` method.
   - Two commands live only in the shell: `open_downloads` and `reveal`.
+  - The shell also posts system notifications (a request while the window is unfocused, and cancellations) and runs the clipboard watcher.
 - Android app: `android\app\src\main\java\app\rustdrop\`.
   - `Core` (in `RustDropApp.kt`) creates the `Node` and exposes `StateFlow`s to Compose.
   - The `Application` holds a multicast lock; without it Android drops mDNS packets.
   - `Files.kt` copies picked or shared content URIs into cache before sending. Received files are verified in app storage, then published to `Download/RustDrop` through MediaStore; a local copy is deleted only after it's fully written.
   - `TransferService` is a dataSync foreground service that runs while any transfer is active.
+  - `Notifications.kt`: the ongoing transfer notification has a Cancel action and is a Live Update (`ProgressStyle` + `EXTRA_REQUEST_PROMOTED_ONGOING`) on API 36+. A request that arrives in the background gets a notification with Decline. `ActionReceiver` handles both buttons.
+  - `TransferIsland` (`ui\Screens.kt`) is the in-app "dynamic island": the accept prompt, a progress pill (tap to expand, with Cancel), then the result for 3 s. It always uses the dark palette (`LocalIsland`).
   - minSdk is 29, the lowest that allows MediaStore Downloads without a storage permission.
   - QR scanning uses `zxing-android-embedded`, whose scanner asks for the camera permission itself. The manifest makes the camera optional and lets the scanner rotate.
   - Don't name a command after a local variable in `main()`. The generated macro picks up the variable instead (this happened with `trust`).
@@ -120,7 +128,14 @@ The big picture:
   - Clipboard sync is opt-in, trusted devices only, and its contents are never logged.
 - Protocol messages are versioned and length-prefixed (`PROTOCOL_VERSION` in `rust-core\src\lib.rs`). Transfer states (IDLE … CANCELLED) must stay identical in the core and both UIs.
 - Shared design tokens go in `shared\design\*.json`, and both platforms use the same values. Never hardcode colours in components.
-- Current goal (ARCHITECTURE §20): Windows and Android discover each other, show device names, set up a trusted encrypted connection, and exchange PING and PONG. Transfers come after that.
+- Status: discovery, QR and fingerprint pairing, cross-subnet probing, file transfer with cancel from either side, notifications and clipboard sync all work.
+- Backlog: key storage in DPAPI/Keystore, certificate expiry check, free-space check, transfer resume, unavailable-device handling, IPv6/QUIC, tray/autostart and release signing.
+
+## Git
+
+- One branch, `main`. Commit only after the gates pass: `cargo fmt --all --check`, clippy, `cargo test --workspace`, `cargo audit`, Android `assembleDebug` + `lintDebug`, and Windows `pnpm build`.
+- `.gitignore` keeps out `Tools\`, `target\`, `node_modules`, build output, APKs and every key or keystore file. Never commit those.
+- Remote: `origin`. Push with `git push origin main`.
 
 ## Skills to use
 
