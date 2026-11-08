@@ -15,6 +15,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.IntentCompat
+import androidx.core.net.toUri
 import androidx.lifecycle.lifecycleScope
 import app.rustdrop.ui.Actions
 import app.rustdrop.ui.PickKind
@@ -22,6 +23,7 @@ import app.rustdrop.ui.RustDropTheme
 import app.rustdrop.ui.RustDropUi
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
@@ -51,13 +53,26 @@ class MainActivity : ComponentActivity() {
         val actions = Actions(
             pick = { kind, device -> pick(kind, device) },
             send = Core::send,
+            sendAll = Core::sendAll,
+            stageText = Core::stageText,
+            sendText = { devices, text -> lifecycleScope.launch { Core.sendText(devices, text) } },
+            dismissText = Core::dismissText,
+            openLink = { url ->
+                if (isLink(url)) runCatching { startActivity(Intent(Intent.ACTION_VIEW, url.toUri())) }
+            },
+            copyText = { text -> copy(text, "Ferrydrop") },
+            pause = Core::pause,
+            resume = Core::resume,
+            clearHistory = Core::clearHistory,
+            rename = Core::rename,
+            setAutoAccept = Core::setAutoAccept,
             clearStaged = Core::clearStaged,
             refresh = { if (Core.started) Core.node.refresh() },
             cancel = Core::cancel,
             respond = Core::respond,
             pair = Core::pair,
             unpair = Core::unpair,
-            copy = { text -> copy(text) },
+            copy = { text -> copy(text, "Ferrydrop fingerprint") },
             openDownloads = { startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)) },
             scanQr = {
                 scanQr.launch(
@@ -96,7 +111,14 @@ class MainActivity : ComponentActivity() {
         val stamp = clip.description.timestamp
         if (stamp == lastClipStamp || clip.itemCount == 0) return
         lastClipStamp = stamp
-        val text = clip.getItemAt(0).coerceToText(this)?.toString() ?: return
+        val item = clip.getItemAt(0)
+        val uri = item.uri
+        if (uri != null && clip.description.hasMimeType("image/*")) {
+            // Our own provider serves the image that just arrived: never send it back.
+            if (uri.authority != Core.clipAuthority) lifecycleScope.launch { Core.clipboardImage(uri) }
+            return
+        }
+        val text = item.coerceToText(this)?.toString() ?: return
         Core.clipboardChanged(text)
     }
 
@@ -134,6 +156,8 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             Core.preparing.value = true
             val items = runCatching { open() }
+            // From Direct Share the app may just have started: give discovery a moment to list the device.
+            if (device != null) awaitPaired(device)
             Core.preparing.value = false
             items.onSuccess { if (device != null) Core.send(device, it) else Core.stage(it) }
                 .onFailure { Core.notice.value = it.message ?: "Couldn't read the selected files." }
@@ -141,17 +165,37 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleShare(intent: Intent?) {
+        if (intent?.action == ACTION_PICK_FILES) {
+            pick(PickKind.Files, null) // from the Quick Settings tile
+            return
+        }
         val uris: List<Uri> = when (intent?.action) {
             Intent.ACTION_SEND -> listOfNotNull(IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java))
             Intent.ACTION_SEND_MULTIPLE ->
                 IntentCompat.getParcelableArrayListExtra(intent, Intent.EXTRA_STREAM, Uri::class.java).orEmpty()
             else -> return
         }
+        // Direct Share: the user picked a paired device in the share sheet.
+        val device = intent.getStringExtra(androidx.core.content.pm.ShortcutManagerCompat.EXTRA_SHORTCUT_ID)
         if (uris.isNotEmpty()) {
-            target = null
+            target = device
             prepare { Files.openUris(this, uris) }
+            return
+        }
+        // A shared link or text (a browser's Share, for example).
+        val text = intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()?.trim()
+        if (!text.isNullOrEmpty()) {
+            if (device == null) return Core.stageText(text)
+            lifecycleScope.launch {
+                if (awaitPaired(device)) Core.sendText(listOf(device), text) else Core.stageText(text)
+            }
         }
     }
+
+    /** Waits up to 5 s for a paired device to be listed. */
+    private suspend fun awaitPaired(device: String) = kotlinx.coroutines.withTimeoutOrNull(5_000) {
+        Core.peers.first { list -> list.any { it.id == device && it.trusted == true } }
+    } != null
 
     private fun askForNotifications() {
         if (Build.VERSION.SDK_INT >= 33 &&
@@ -161,8 +205,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun copy(text: String) {
-        getSystemService(ClipboardManager::class.java)
-            .setPrimaryClip(ClipData.newPlainText("RustDrop fingerprint", text))
+    private fun copy(text: String, label: String) {
+        getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText(label, text))
+    }
+
+    companion object {
+        const val ACTION_PICK_FILES = "app.rustdrop.action.PICK_FILES"
     }
 }

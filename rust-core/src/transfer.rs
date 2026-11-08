@@ -71,7 +71,13 @@ pub struct Incoming {
     pub peer: DeviceInfo,
     /// Label from the local trust store, the only name proven by the TLS handshake.
     pub trusted_name: String,
+    /// Certificate fingerprint proven by the TLS handshake.
+    pub fingerprint: String,
     pub files: Vec<FileMeta>,
+    /// One clipboard image (clipboard sync), not files for the user to save.
+    pub clipboard: bool,
+    /// The same files from the same device that the user accepted before the sender paused.
+    pub resumed: bool,
     pub decision: oneshot::Sender<bool>,
 }
 
@@ -106,16 +112,25 @@ pub enum Event {
         text: String,
         from: String,
     },
+    /// A link or text the paired device `from` sent on purpose.
+    Text {
+        text: String,
+        from: String,
+    },
     /// The transfer stopped because someone cancelled it. `by_peer`: the sender did, not this device.
     Cancelled {
         transfer_id: Uuid,
         by_peer: bool,
     },
+    /// The sender paused; what arrived is kept until it sends the same files again.
+    Paused {
+        transfer_id: Uuid,
+    },
 }
 
 /// Receiver state shared by all sessions.
 pub struct Inbox {
-    dest: PathBuf,
+    dest: std::sync::RwLock<PathBuf>,
     events: mpsc::Sender<Event>,
     used_ids: Mutex<HashSet<Uuid>>,
     cancels: Mutex<HashMap<Uuid, watch::Sender<bool>>>,
@@ -123,6 +138,8 @@ pub struct Inbox {
     active: Mutex<HashMap<Uuid, Arc<Active>>>,
     /// Staging folders in use, so two transfers of the same files never share one.
     busy: Mutex<HashSet<String>>,
+    /// Staging keys of accepted transfers the sender paused (this run only).
+    paused: Mutex<HashSet<String>>,
     /// Test hook: drop the next data connection after reading a chunk, before acknowledging it.
     #[cfg(test)]
     pub(crate) drop_next_stream: AtomicBool,
@@ -131,15 +148,25 @@ pub struct Inbox {
 impl Inbox {
     pub fn new(dest: PathBuf, events: mpsc::Sender<Event>) -> Self {
         Self {
-            dest,
+            dest: dest.into(),
             events,
             used_ids: Mutex::new(HashSet::new()),
             cancels: Mutex::default(),
             active: Mutex::default(),
             busy: Mutex::default(),
+            paused: Mutex::default(),
             #[cfg(test)]
             drop_next_stream: AtomicBool::new(false),
         }
+    }
+
+    /// Where new transfers are saved. Transfers already running keep their folder.
+    pub fn set_dest(&self, dest: PathBuf) {
+        *self.dest.write().unwrap() = dest;
+    }
+
+    fn dest(&self) -> PathBuf {
+        self.dest.read().unwrap().clone()
     }
 
     pub(crate) async fn notify(&self, event: Event) {
@@ -159,6 +186,8 @@ impl Inbox {
 #[derive(Debug)]
 pub(crate) struct Cancelled {
     pub by_peer: bool,
+    /// The sender paused instead (keep what arrived).
+    pub paused: bool,
 }
 
 impl std::fmt::Display for Cancelled {
@@ -186,7 +215,7 @@ async fn cancelled(rx: &mut watch::Receiver<bool>) {
 }
 
 /// Transfer states shown by every UI (ARCHITECTURE.md §11).
-#[derive(serde::Serialize, Clone, Copy, Debug, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq)]
 #[cfg_attr(feature = "uniffi", derive(uniffi::Enum))]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum TransferState {
@@ -196,11 +225,15 @@ pub enum TransferState {
     Completed,
     Failed,
     Cancelled,
+    /// The sender paused; it can send the same files again to continue.
+    Paused,
 }
 
 #[derive(Debug, PartialEq)]
 pub enum Outcome {
     Completed,
+    /// This side paused (see `SendOptions::pause`); the receiver keeps what arrived.
+    Paused,
     /// `reason` is set when the receiver declined automatically (for example, no free space).
     Declined {
         reason: Option<String>,
@@ -508,9 +541,14 @@ pub(crate) async fn receive<S: AsyncRead + AsyncWrite + Unpin>(
     trusted_name: &str,
     transfer_id: Uuid,
     files: Vec<FileMeta>,
+    clipboard: bool,
     inbox: &Inbox,
 ) -> Result<()> {
     let checked = validate(&files).and_then(|v| {
+        ensure!(
+            !clipboard || files.len() == 1,
+            "clipboard transfer must be one file"
+        );
         ensure!(
             inbox.used_ids.lock().unwrap().insert(transfer_id),
             "transfer id reused"
@@ -532,8 +570,10 @@ pub(crate) async fn receive<S: AsyncRead + AsyncWrite + Unpin>(
     // Resume needs a staging folder of its own; a second copy of the same files starts fresh.
     let key = resume_key(fingerprint, &files);
     let resumable = inbox.busy.lock().unwrap().insert(key.clone());
+    let resumed = resumable && inbox.paused.lock().unwrap().remove(&key);
     let busy = inbox.busy.lock().unwrap().clone();
-    clean_stale(&inbox.dest, &busy).await;
+    let dest = inbox.dest();
+    clean_stale(&dest, &busy).await;
     let (cancel_tx, mut cancel) = watch::channel(false);
     inbox.cancels.lock().unwrap().insert(transfer_id, cancel_tx);
     let job = Job {
@@ -544,7 +584,9 @@ pub(crate) async fn receive<S: AsyncRead + AsyncWrite + Unpin>(
         paths,
         sizes: files.iter().map(|f| f.size).collect(),
         total,
-        staging: inbox.dest.join(format!(
+        clipboard,
+        resumed,
+        staging: dest.join(format!(
             ".rustdrop-{}",
             if resumable {
                 key.clone()
@@ -552,6 +594,8 @@ pub(crate) async fn receive<S: AsyncRead + AsyncWrite + Unpin>(
                 transfer_id.to_string()
             }
         )),
+        dest,
+        key: key.clone(),
         resumable,
     };
     let result = run_receive(stream, &job, files, &mut cancel, inbox).await;
@@ -571,7 +615,12 @@ struct Job<'a> {
     paths: Vec<PathBuf>,
     sizes: Vec<u64>,
     total: u64,
+    clipboard: bool,
+    resumed: bool,
     staging: PathBuf,
+    /// The downloads folder when the request arrived.
+    dest: PathBuf,
+    key: String,
     resumable: bool,
 }
 
@@ -600,13 +649,13 @@ async fn run_receive<S: AsyncRead + AsyncWrite + Unpin>(
     };
 
     // Not enough room: decline before bothering the user, and say why on both devices.
-    fs::create_dir_all(&inbox.dest).await?;
+    fs::create_dir_all(&job.dest).await?;
     let mut need = job.total - layout.bytes_in(&have);
     if cfg!(target_os = "android") {
         // The app then copies each file into Downloads on the same storage before deleting its own.
         need += job.sizes.iter().max().copied().unwrap_or(0);
     }
-    let free = disk::available_space(&inbox.dest).unwrap_or(u64::MAX);
+    let free = disk::available_space(&job.dest).unwrap_or(u64::MAX);
     if free < need.saturating_add(SPACE_MARGIN) {
         let (need, free) = (human(need), human(free.saturating_sub(SPACE_MARGIN)));
         let reply = Message::Decline {
@@ -634,7 +683,10 @@ async fn run_receive<S: AsyncRead + AsyncWrite + Unpin>(
         transfer_id,
         peer: job.peer.clone(),
         trusted_name: job.trusted_name.into(),
+        fingerprint: job.fingerprint.into(),
         files,
+        clipboard: job.clipboard,
+        resumed: job.resumed,
         decision,
     };
     let _ = inbox.events.send(Event::Incoming(request)).await;
@@ -644,7 +696,7 @@ async fn run_receive<S: AsyncRead + AsyncWrite + Unpin>(
         _ = cancelled(cancel) => false,
         _ = protocol::read(stream) => {
             inbox.notify(Event::Cancelled { transfer_id, by_peer: true }).await;
-            return Err(Cancelled { by_peer: true }.into());
+            return Err(Cancelled { by_peer: true, paused: false }.into());
         }
     };
     if !accepted {
@@ -731,13 +783,25 @@ async fn run_receive<S: AsyncRead + AsyncWrite + Unpin>(
             inbox.notify(Event::Completed { transfer_id, saved }).await;
             Ok(())
         }
+        Err(e) if e.downcast_ref::<Cancelled>().is_some_and(|c| c.paused) && job.resumable => {
+            // Keep what arrived; the sender's resume is accepted without asking again.
+            let (a, list) = (active.clone(), job.chunk_list());
+            let _ = tokio::task::spawn_blocking(move || checkpoint(&a, &list)).await;
+            active.files.lock().unwrap().clear();
+            inbox.paused.lock().unwrap().insert(job.key.clone());
+            inbox.notify(Event::Paused { transfer_id }).await;
+            Err(e)
+        }
         Err(e) if e.is::<Cancelled>() => {
             active.files.lock().unwrap().clear();
             remove_staging(&job.staging).await;
             let by_peer = e.downcast_ref::<Cancelled>().is_some_and(|c| c.by_peer);
             if !by_peer {
                 // Tell the sender, which reads the control connection while it streams.
-                let reply = Message::Cancel { transfer_id };
+                let reply = Message::Cancel {
+                    transfer_id,
+                    pause: false,
+                };
                 let _ = timeout(Duration::from_secs(2), protocol::write(stream, &reply)).await;
             }
             inbox
@@ -821,13 +885,13 @@ async fn wait_for_data<S: AsyncRead + Unpin>(
     loop {
         tokio::select! {
             biased;
-            _ = cancelled(cancel) => return Err(Cancelled { by_peer: false }.into()),
+            _ = cancelled(cancel) => return Err(Cancelled { by_peer: false, paused: false }.into()),
             m = &mut msg => {
                 return match m.context("connection to the sender was lost")? {
                     Message::TransferComplete { transfer_id: id, sha256 } if id == job.transfer_id => {
                         Ok(sha256)
                     }
-                    Message::Cancel { .. } => Err(Cancelled { by_peer: true }.into()),
+                    Message::Cancel { pause, .. } => Err(Cancelled { by_peer: true, paused: pause }.into()),
                     other => bail!("expected TRANSFER_COMPLETE, got {other:?}"),
                 };
             }
@@ -884,8 +948,8 @@ async fn finish(
     let staged = job.files_dir();
     let mut saved = Vec::with_capacity(job.paths.len());
     for rel in &job.paths {
-        let target = unique(&inbox.dest.join(rel)).await?;
-        fs::create_dir_all(target.parent().unwrap_or(&inbox.dest)).await?;
+        let target = unique(&job.dest.join(rel)).await?;
+        fs::create_dir_all(target.parent().unwrap_or(&job.dest)).await?;
         fs::rename(staged.join(rel), &target).await?;
         saved.push(target);
     }
@@ -1000,6 +1064,40 @@ pub enum Source {
     Open { name: String, file: File },
 }
 
+impl Source {
+    /// A second handle to the same thing (to send it again or to another device).
+    /// Reads are positional, so sharing an open file's cursor does not matter.
+    pub fn try_clone(&self) -> io::Result<Self> {
+        Ok(match self {
+            Self::Path(p) => Self::Path(p.clone()),
+            Self::Open { name, file } => Self::Open {
+                name: name.clone(),
+                file: file.try_clone()?,
+            },
+        })
+    }
+
+    /// The name the receiver sees first (for lists and history).
+    pub fn name(&self) -> String {
+        match self {
+            Self::Path(p) => p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            Self::Open { name, .. } => name.rsplit('/').next().unwrap_or(name).into(),
+        }
+    }
+}
+
+/// How `send_with` behaves beyond the defaults.
+#[derive(Default, Clone)]
+pub struct SendOptions {
+    /// Set before raising `cancel` to pause instead: the receiver keeps what arrived.
+    pub pause: Arc<AtomicBool>,
+    /// The one file is a clipboard image (clipboard sync).
+    pub clipboard: bool,
+}
+
 /// Where a file's bytes are read from.
 enum Reader {
     Path(PathBuf),
@@ -1101,9 +1199,33 @@ pub async fn send(
     identity: Arc<Identity>,
     trust: Arc<TrustStore>,
     sources: Vec<Source>,
+    cancel: watch::Receiver<bool>,
+    progress: impl FnMut(u64, u64),
+) -> Result<Outcome> {
+    let options = SendOptions::default();
+    send_with(addr, identity, trust, sources, cancel, progress, &options).await
+}
+
+/// `send` that can pause (see [`SendOptions`]) or carry a clipboard image.
+pub async fn send_with(
+    addr: std::net::SocketAddr,
+    identity: Arc<Identity>,
+    trust: Arc<TrustStore>,
+    sources: Vec<Source>,
     mut cancel: watch::Receiver<bool>,
     mut progress: impl FnMut(u64, u64),
+    options: &SendOptions,
 ) -> Result<Outcome> {
+    // Tells the receiver why we stopped; the caller set `pause` first if it is a pause.
+    let stop = |transfer_id| {
+        let pause = options.pause.load(Ordering::SeqCst);
+        let outcome = if pause {
+            Outcome::Paused
+        } else {
+            Outcome::Cancelled { by_peer: false }
+        };
+        (Message::Cancel { transfer_id, pause }, outcome)
+    };
     let (readers, files): (Vec<Reader>, Vec<FileMeta>) =
         tokio::task::spawn_blocking(move || collect(sources))
             .await??
@@ -1118,13 +1240,15 @@ pub async fn send(
     let request = Message::SendRequest {
         transfer_id,
         files: files.clone(),
+        clipboard: options.clipboard,
     };
     protocol::write(&mut wr, &request).await?;
     let reply = tokio::select! {
         r = timeout(DECISION_TIMEOUT + IDLE_TIMEOUT, protocol::read(&mut rd)) => r??,
         _ = cancelled(&mut cancel) => {
-            let _ = protocol::write(&mut wr, &Message::Cancel { transfer_id }).await;
-            return Ok(Outcome::Cancelled { by_peer: false });
+            let (msg, outcome) = stop(transfer_id);
+            let _ = protocol::write(&mut wr, &msg).await;
+            return Ok(outcome);
         }
     };
     let (token, have) = match reply {
@@ -1196,9 +1320,10 @@ pub async fn send(
             _ = cancelled(&mut cancel) => {
                 workers.abort_all();
                 drop(reply);
-                let _ = protocol::write(&mut wr, &Message::Cancel { transfer_id }).await;
+                let (msg, outcome) = stop(transfer_id);
+                let _ = protocol::write(&mut wr, &msg).await;
                 let _ = wr.shutdown().await;
-                return Ok(Outcome::Cancelled { by_peer: false });
+                return Ok(outcome);
             }
             joined = workers.join_next() => match joined {
                 None => break,
@@ -1576,6 +1701,68 @@ mod tests {
     }
 
     /// Answers every incoming request with `accept`.
+    #[tokio::test]
+    async fn paused_transfer_resumes_without_asking_and_arrives_intact() {
+        let ((a, a_trust), (b, b_trust)) = trusted_pair();
+        let dest = temp_dir("dest");
+        let s = start(b, b_trust, dest.clone()).await;
+        let mut events = s.events;
+        let path = big_file("pause", 64);
+
+        let (stop_tx, stop) = watch::channel(false);
+        let options = SendOptions::default();
+        options.pause.store(true, Ordering::SeqCst);
+        let (seen_tx, mut seen) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(ev) = events.recv().await {
+                match ev {
+                    Event::Incoming(req) => {
+                        let _ = seen_tx.send(format!("incoming resumed={}", req.resumed));
+                        // Only the first request is answered by "the user".
+                        let _ = req.decision.send(true);
+                    }
+                    Event::Paused { .. } => drop(seen_tx.send("paused".into())),
+                    Event::Completed { .. } => drop(seen_tx.send("completed".into())),
+                    Event::Failed { reason, .. } => drop(seen_tx.send(reason)),
+                    _ => {}
+                }
+            }
+        });
+        let outcome = send_with(
+            s.addr,
+            a.clone(),
+            a_trust.clone(),
+            paths(std::slice::from_ref(&path)),
+            stop,
+            move |_, _| {
+                let _ = stop_tx.send(true);
+            },
+            &options,
+        )
+        .await;
+        assert_eq!(outcome.unwrap(), Outcome::Paused);
+        assert_eq!(seen.recv().await.unwrap(), "incoming resumed=false");
+        assert_eq!(seen.recv().await.unwrap(), "paused");
+        assert!(!staging_is_gone(&dest), "a pause keeps what arrived");
+
+        let outcome = send(
+            s.addr,
+            a,
+            a_trust,
+            paths(std::slice::from_ref(&path)),
+            never(),
+            |_, _| {},
+        )
+        .await;
+        assert_eq!(outcome.unwrap(), Outcome::Completed);
+        assert_eq!(seen.recv().await.unwrap(), "incoming resumed=true");
+        assert_eq!(seen.recv().await.unwrap(), "completed");
+        assert_eq!(
+            std::fs::read(dest.join("big.bin")).unwrap(),
+            std::fs::read(&path).unwrap()
+        );
+    }
+
     fn auto_answer(mut events: mpsc::Receiver<Event>, accept: bool) {
         tokio::spawn(async move {
             while let Some(ev) = events.recv().await {
@@ -1721,7 +1908,7 @@ mod tests {
             };
             let (i, fp) = (inbox.clone(), fingerprint.to_string());
             let received = tokio::spawn(async move {
-                receive(&mut theirs, &peer, &fp, "peer", id, files, &i).await
+                receive(&mut theirs, &peer, &fp, "peer", id, files, false, &i).await
             });
             Self {
                 control,

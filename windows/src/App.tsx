@@ -8,13 +8,18 @@ import {
   Clock,
   Copy,
   Download,
+  ExternalLink,
   File,
   Files,
   Folder,
   History,
   House,
+  Link as LinkIcon,
   LoaderCircle,
   Monitor,
+  Pause,
+  Pencil,
+  Play,
   RefreshCw,
   Send,
   Settings,
@@ -22,6 +27,7 @@ import {
   ShieldCheck,
   QrCode as QrIcon,
   Smartphone,
+  Trash2,
   X,
   type LucideIcon,
 } from "lucide-react";
@@ -30,10 +36,13 @@ import {
   ACTIVE,
   api,
   events,
+  fromHistory,
+  isLink,
   type IncomingRequest,
   type PairingOffer,
   type Me,
   type Peer,
+  type ReceivedText,
   type Transfer,
   type TransferState,
   type TransferUpdate,
@@ -70,6 +79,9 @@ export function App() {
   const [lastPaired, setLastPaired] = useState<{ name: string; at: number } | null>(null);
   const [clipSync, setClipSyncState] = useState(false);
   const [clipFrom, setClipFrom] = useState<string | null>(null);
+  /** A link or text waiting for a device, like `staged` for files. */
+  const [stagedText, setStagedText] = useState<string | null>(null);
+  const [texts, setTexts] = useState<ReceivedText[]>([]);
   const setClipSync = (on: boolean) =>
     api.setClipboardSync(on).then(() => setClipSyncState(on)).catch((e) => setNotice({ tone: "error", text: String(e) }));
 
@@ -88,6 +100,7 @@ export function App() {
           id: u.id,
           outgoing: false,
           peer: "",
+          name: "",
           items: 0,
           total: 0,
           done: 0,
@@ -114,6 +127,11 @@ export function App() {
     });
     api.peers().then(setPeers);
     api.clipboardSync().then(setClipSyncState);
+    // Older transfers from history go below anything that already arrived this run.
+    api.history().then((h) =>
+      setTransfers((list) => [...list, ...h.filter((x) => !list.some((t) => t.id === x.id)).map(fromHistory)]),
+    );
+    api.takeLaunchPaths().then((paths) => paths.length && setStaged(paths));
     reloadTrusted();
     const stopSearching = setTimeout(() => setSearching(false), 4000);
     const subs = [
@@ -131,6 +149,12 @@ export function App() {
       events.paired((name) => {
         setLastPaired({ name, at: Date.now() });
         reloadTrusted();
+      }),
+      events.text((text, from) => setTexts((list) => [{ text, from, at: Date.now() }, ...list].slice(0, 5))),
+      // "Send with Ferrydrop" in Explorer: each file arrives on its own, so collect them.
+      events.staged((paths) => {
+        setStaged((list) => [...list, ...paths.filter((p) => !list.includes(p))]);
+        setView("home");
       }),
       events.incoming((r) => {
         setRequests((q) => [...q, r]);
@@ -163,6 +187,27 @@ export function App() {
     }
   };
 
+  const sendTextTo = async (targets: Peer[], text: string) => {
+    const failed: string[] = [];
+    for (const p of targets) await api.sendText(p.id, text).catch((e) => failed.push(`${p.name}: ${e}`));
+    setStagedText(null);
+    setNotice(
+      failed.length
+        ? { tone: "error", text: failed.join(" ") }
+        : { tone: "info", text: `Sent to ${targets.map((p) => p.name).join(", ")}.` },
+    );
+  };
+
+  /** Sends what is staged (files or text) to every paired device nearby. */
+  const sendToAll = async () => {
+    const paired = peers.filter((p) => p.trusted);
+    if (stagedText) return sendTextTo(paired, stagedText);
+    const failed: string[] = [];
+    for (const p of paired) await api.send(p.id, staged).catch((e) => failed.push(`${p.name}: ${e}`));
+    setStaged([]);
+    setNotice(failed.length ? { tone: "error", text: failed.join(" ") } : null);
+  };
+
   const choose = async (directory: boolean) => {
     const picked = await open({ multiple: true, directory });
     if (!picked) return null;
@@ -175,6 +220,7 @@ export function App() {
       setView("trusted");
       return;
     }
+    if (stagedText && peer.trusted) return sendTextTo([peer], stagedText);
     if (staged.length) return sendTo(peer, staged);
     const paths = await choose(false);
     if (paths) sendTo(peer, paths);
@@ -184,6 +230,7 @@ export function App() {
     const paths = await choose(directory);
     if (paths) {
       setStaged(paths);
+      setStagedText(null);
       setNotice(null);
     }
   };
@@ -230,7 +277,13 @@ export function App() {
     api.respond(r.id, accept);
   };
 
-  const reveal = (path: string) => api.reveal(path).catch((e) => setNotice({ tone: "error", text: String(e) }));
+  const fail = (e: unknown) => setNotice({ tone: "error", text: String(e) });
+  const transferActions: TransferActions = {
+    cancel: (id) => api.cancel(id),
+    pause: (id) => api.pause(id),
+    resume: (id) => api.resume(id).catch(fail),
+    reveal: (path) => api.reveal(path).catch(fail),
+  };
   const activeCount = transfers.filter((t) => ACTIVE.includes(t.state)).length;
 
   return (
@@ -239,7 +292,7 @@ export function App() {
         <nav className="sidebar" aria-label="Main">
           <div className="brand">
             <img src={logo} alt="" width={28} height={28} />
-            <span>RustDrop</span>
+            <span>Ferrydrop</span>
           </div>
           {NAV.map((n) => (
             <button
@@ -264,7 +317,7 @@ export function App() {
           {fatal && (
             <p className="banner" role="alert">
               <CircleAlert size={18} aria-hidden />
-              RustDrop can't receive files right now: {fatal}
+              Ferrydrop can't receive files right now: {fatal}
             </p>
           )}
           {view === "home" && (
@@ -280,17 +333,38 @@ export function App() {
               dropTarget={dropTarget}
               notice={notice}
               transfers={transfers}
+              stagedText={stagedText}
+              texts={texts}
               onDevice={onDevice}
               onPick={onPick}
-              onClearStaged={() => setStaged([])}
+              onStageText={(t) => {
+                setStagedText(t);
+                setStaged([]);
+                setNotice(null);
+              }}
+              onClearStaged={() => {
+                setStaged([]);
+                setStagedText(null);
+              }}
+              onSendToAll={sendToAll}
+              onDismissText={(at) => setTexts((list) => list.filter((x) => x.at !== at))}
+              onError={(text) => setNotice({ tone: "error", text })}
               onRefresh={() => api.refresh()}
-              onCancel={(id) => api.cancel(id)}
-              onReveal={reveal}
+              actions={transferActions}
               onShowActivity={() => setView("activity")}
             />
           )}
           {view === "activity" && (
-            <ActivityView transfers={transfers} onCancel={(id) => api.cancel(id)} onReveal={reveal} />
+            <ActivityView
+              transfers={transfers}
+              actions={transferActions}
+              onClear={() =>
+                api
+                  .clearHistory()
+                  .then(() => setTransfers((list) => list.filter((t) => ACTIVE.includes(t.state) || t.state === "PAUSED")))
+                  .catch((e) => setNotice({ tone: "error", text: String(e) }))
+              }
+            />
           )}
           {view === "trusted" && me && (
             <TrustedView
@@ -304,13 +378,27 @@ export function App() {
               onPairedShown={() => setLastPaired(null)}
             />
           )}
-          {view === "settings" && me && <SettingsView me={me} clipSync={clipSync} setClipSync={setClipSync} />}
+          {view === "settings" && me && (
+            <SettingsView
+              me={me}
+              clipSync={clipSync}
+              setClipSync={setClipSync}
+              onDownloadsChanged={() => api.me().then(setMe)}
+            />
+          )}
         </main>
       </div>
       {requests[0] && <IncomingDialog key={requests[0].id} request={requests[0]} onAnswer={respond} />}
     </div>
   );
 }
+
+type TransferActions = {
+  cancel: (id: string) => void;
+  pause: (id: string) => void;
+  resume: (id: string) => void;
+  reveal: (path: string) => void;
+};
 
 function HomeView(props: {
   clipSync: boolean;
@@ -320,20 +408,35 @@ function HomeView(props: {
   peers: Peer[];
   searching: boolean;
   staged: string[];
+  stagedText: string | null;
+  texts: ReceivedText[];
   dragging: boolean;
   dropTarget: string | null;
   notice: Notice | null;
   transfers: Transfer[];
   onDevice: (p: Peer) => void;
   onPick: (directory: boolean) => void;
+  onStageText: (text: string) => void;
   onClearStaged: () => void;
+  onSendToAll: () => void;
+  onDismissText: (at: number) => void;
+  onError: (text: string) => void;
   onRefresh: () => void;
-  onCancel: (id: string) => void;
-  onReveal: (path: string) => void;
+  actions: TransferActions;
   onShowActivity: () => void;
 }) {
-  const { peers, staged } = props;
+  const { peers, staged, stagedText } = props;
   const recent = props.transfers.slice(0, 3);
+  const pairedCount = peers.filter((p) => p.trusted).length;
+  const [composing, setComposing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const stageDraft = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!draft.trim()) return;
+    props.onStageText(draft.trim());
+    setDraft("");
+    setComposing(false);
+  };
   return (
     <>
       <header className="page-head">
@@ -353,6 +456,38 @@ function HomeView(props: {
         )}
       </header>
 
+      {props.texts.length > 0 && (
+        <section aria-label="Received links and text">
+          <ul className="texts">
+            {props.texts.map((t) => (
+              <li key={t.at} className="text-card">
+                <LinkIcon size={18} aria-hidden />
+                <div className="text-body">
+                  <span className="caption">From {t.from}</span>
+                  <span className="text-value">{t.text}</span>
+                </div>
+                {isLink(t.text) && (
+                  <button className="btn secondary" onClick={() => api.openLink(t.text).catch((e) => props.onError(String(e)))}>
+                    <ExternalLink size={16} aria-hidden />
+                    Open
+                  </button>
+                )}
+                <button
+                  className="btn tertiary"
+                  onClick={() => navigator.clipboard.writeText(t.text).then(() => props.onDismissText(t.at))}
+                >
+                  <Copy size={16} aria-hidden />
+                  Copy
+                </button>
+                <button className="btn tertiary" aria-label="Dismiss" onClick={() => props.onDismissText(t.at)}>
+                  <X size={16} aria-hidden />
+                </button>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
+
       <section className="nearby" aria-labelledby="nearby-title">
         <div className="section-head">
           <h2 id="nearby-title">Nearby devices</h2>
@@ -362,12 +497,19 @@ function HomeView(props: {
           </button>
         </div>
 
-        {staged.length > 0 && (
+        {(staged.length > 0 || stagedText) && (
           <div className="staged" role="status">
-            <Files size={18} aria-hidden />
+            {stagedText ? <LinkIcon size={18} aria-hidden /> : <Files size={18} aria-hidden />}
             <span>
-              {plural(staged.length, "item")} ready. Choose a device to send {staged.length === 1 ? "it" : "them"} to.
+              {stagedText
+                ? `"${stagedText.length > 60 ? stagedText.slice(0, 60) + "..." : stagedText}" ready. Choose a device to send it to.`
+                : `${plural(staged.length, "item")} ready. Choose a device to send ${staged.length === 1 ? "it" : "them"} to.`}
             </span>
+            {pairedCount > 1 && (
+              <button className="btn secondary" onClick={props.onSendToAll}>
+                Send to all {pairedCount} paired
+              </button>
+            )}
             <button className="btn tertiary" onClick={props.onClearStaged}>
               Clear
             </button>
@@ -387,7 +529,7 @@ function HomeView(props: {
             <Empty
               icon={<Monitor size={28} aria-hidden />}
               title="No devices nearby"
-              text="Make sure both devices are connected to the same network and RustDrop is running."
+              text="Make sure both devices are connected to the same network and Ferrydrop is running."
               action={
                 <button className="btn secondary" onClick={props.onRefresh}>
                   <RefreshCw size={16} aria-hidden />
@@ -421,7 +563,31 @@ function HomeView(props: {
           <Folder size={18} aria-hidden />
           Send a folder
         </button>
+        <button className="btn secondary" onClick={() => setComposing(!composing)} aria-expanded={composing}>
+          <LinkIcon size={18} aria-hidden />
+          Send a link or text
+        </button>
       </div>
+      {composing && (
+        <form className="compose" onSubmit={stageDraft}>
+          <label>
+            Link or text
+            <textarea
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              rows={2}
+              maxLength={65536}
+              autoFocus
+              placeholder="https://..."
+            />
+          </label>
+          <div>
+            <button className="btn primary" type="submit" disabled={!draft.trim()}>
+              Choose a device
+            </button>
+          </div>
+        </form>
+      )}
 
       {recent.length > 0 && (
         <section aria-labelledby="recent-title">
@@ -431,7 +597,7 @@ function HomeView(props: {
               See all
             </button>
           </div>
-          <TransferList transfers={recent} onCancel={props.onCancel} onReveal={props.onReveal} />
+          <TransferList transfers={recent} actions={props.actions} />
         </section>
       )}
     </>
@@ -470,31 +636,55 @@ function DeviceTile({ peer, target, onClick }: { peer: Peer; target: boolean; on
   );
 }
 
-function ActivityView(props: { transfers: Transfer[]; onCancel: (id: string) => void; onReveal: (p: string) => void }) {
+function ActivityView(props: { transfers: Transfer[]; actions: TransferActions; onClear: () => void }) {
+  const [confirming, setConfirming] = useState(false);
+  const finished = props.transfers.some((t) => !ACTIVE.includes(t.state) && t.state !== "PAUSED");
   return (
     <>
-      <header className="page-head">
+      <header className="page-head section-head">
         <h1>Activity</h1>
+        {finished &&
+          (confirming ? (
+            <div className="confirm" role="group" aria-label="Clear history?">
+              <button
+                className="btn destructive"
+                onClick={() => {
+                  props.onClear();
+                  setConfirming(false);
+                }}
+              >
+                Clear history
+              </button>
+              <button className="btn tertiary" onClick={() => setConfirming(false)}>
+                Keep
+              </button>
+            </div>
+          ) : (
+            <button className="btn tertiary" onClick={() => setConfirming(true)}>
+              <Trash2 size={16} aria-hidden />
+              Clear history
+            </button>
+          ))}
       </header>
       {props.transfers.length === 0 ? (
         <Empty
           icon={<History size={28} aria-hidden />}
           title="Nothing shared yet"
-          text="Your recent transfers will appear here."
+          text="Your transfers will appear here. Ferrydrop keeps the last 200, and never the files themselves."
         />
       ) : (
-        <TransferList {...props} />
+        <TransferList transfers={props.transfers} actions={props.actions} />
       )}
     </>
   );
 }
 
-function TransferList(props: { transfers: Transfer[]; onCancel: (id: string) => void; onReveal: (p: string) => void }) {
+function TransferList(props: { transfers: Transfer[]; actions: TransferActions }) {
   return (
     <ul className="transfers">
       {props.transfers.map((t) => (
         <li key={t.id}>
-          <TransferRow t={t} onCancel={props.onCancel} onReveal={props.onReveal} />
+          <TransferRow t={t} actions={props.actions} />
         </li>
       ))}
     </ul>
@@ -508,15 +698,18 @@ const STATE_ICON: Record<TransferState, LucideIcon> = {
   COMPLETED: CircleCheck,
   FAILED: CircleAlert,
   CANCELLED: X,
+  PAUSED: Pause,
 };
 
-function TransferRow({ t, onCancel, onReveal }: { t: Transfer; onCancel: (id: string) => void; onReveal: (p: string) => void }) {
+function TransferRow({ t, actions }: { t: Transfer; actions: TransferActions }) {
   const pct = t.total ? Math.min(100, Math.floor((t.done * 100) / t.total)) : 0;
   const seconds = t.flowingAt ? (Date.now() - t.flowingAt) / 1000 : 0;
   const speed = seconds > 0.5 ? t.done / seconds : 0;
   const left = speed > 0 ? (t.total - t.done) / speed : null;
   const title = t.outgoing ? `To ${t.peer}` : `From ${t.peer}`;
-  const size = t.total ? `${plural(t.items, "item")}, ${formatBytes(t.total)}` : plural(t.items, "item");
+  const what = t.name ? (t.items > 1 ? `${t.name} and ${plural(t.items - 1, "more item")}` : t.name) : plural(t.items, "item");
+  const size = t.total ? `${what}, ${formatBytes(t.total)}` : what;
+  const when = ACTIVE.includes(t.state) ? "" : new Date(t.startedAt).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
   const StateIcon = STATE_ICON[t.state];
   const moving = t.state === "TRANSFERRING" || t.state === "VERIFYING";
 
@@ -542,7 +735,11 @@ function TransferRow({ t, onCancel, onReveal }: { t: Transfer; onCancel: (id: st
     case "CANCELLED":
       status = t.reason ?? "Cancelled";
       break;
+    case "PAUSED":
+      status = t.outgoing ? "Paused. Resume continues where it stopped." : (t.reason ?? "Paused");
+      break;
   }
+  if (when) status += `. ${when}`;
 
   return (
     <article className="transfer" data-state={t.state}>
@@ -572,14 +769,27 @@ function TransferRow({ t, onCancel, onReveal }: { t: Transfer; onCancel: (id: st
         </p>
       </div>
       <div className="transfer-actions">
-        {ACTIVE.includes(t.state) && (t.outgoing || t.state !== "WAITING_FOR_ACCEPT") && (
-          <button className="btn tertiary" onClick={() => onCancel(t.id)}>
+        {t.outgoing && t.state === "TRANSFERRING" && (
+          <button className="btn tertiary" onClick={() => actions.pause(t.id)}>
+            <Pause size={16} aria-hidden />
+            Pause
+          </button>
+        )}
+        {t.outgoing && t.state === "PAUSED" && (
+          <button className="btn secondary" onClick={() => actions.resume(t.id)}>
+            <Play size={16} aria-hidden />
+            Resume
+          </button>
+        )}
+        {((ACTIVE.includes(t.state) && (t.outgoing || t.state !== "WAITING_FOR_ACCEPT")) ||
+          (t.outgoing && t.state === "PAUSED")) && (
+          <button className="btn tertiary" onClick={() => actions.cancel(t.id)}>
             <X size={16} aria-hidden />
             Cancel
           </button>
         )}
         {!t.outgoing && t.state === "COMPLETED" && t.saved?.[0] && (
-          <button className="btn secondary" onClick={() => onReveal(t.saved![0])}>
+          <button className="btn secondary" onClick={() => actions.reveal(t.saved![0])}>
             <Folder size={16} aria-hidden />
             Show in folder
           </button>
@@ -625,7 +835,7 @@ function IncomingDialog({ request, onAnswer }: { request: IncomingRequest; onAns
           ))}
           {request.count > shown.length && <li className="more">and {request.count - shown.length} more</li>}
         </ul>
-        <p className="caption">Files are checked before they're saved to your RustDrop downloads folder.</p>
+        <p className="caption">Files are checked before they're saved to your Ferrydrop downloads folder.</p>
         <div className="dialog-actions">
           <button ref={decline} className="btn secondary" onClick={() => onAnswer(request, false)}>
             Decline
@@ -682,6 +892,19 @@ function TrustedView(props: {
     props.onChanged();
   };
 
+  const [renaming, setRenaming] = useState<string | null>(null);
+  const [newName, setNewName] = useState("");
+  const rename = async (e: React.FormEvent, fp: string) => {
+    e.preventDefault();
+    try {
+      await api.rename(fp, newName);
+      setRenaming(null);
+      props.onChanged();
+    } catch (err) {
+      setError(String(err));
+    }
+  };
+
   const [offer, setOffer] = useState<PairingOffer | null>(null);
   const [secondsLeft, setSecondsLeft] = useState(0);
   const [qrError, setQrError] = useState<string | null>(null);
@@ -736,7 +959,7 @@ function TrustedView(props: {
             <QrImage offer={offer} />
             <div className="qr-text">
               <p>
-                On the other device, open RustDrop, go to Settings and tap <strong>Scan QR code</strong>. Both devices
+                On the other device, open Ferrydrop, go to Settings and tap <strong>Scan QR code</strong>. Both devices
                 will be paired.
               </p>
               <p className="caption" aria-live="polite">
@@ -846,11 +1069,48 @@ function TrustedView(props: {
                 <span className="avatar small">
                   <ShieldCheck size={18} aria-hidden />
                 </span>
-                <div className="trusted-text">
-                  <strong>{t.name}</strong>
-                  <code className="caption">{t.fingerprint.slice(0, 19).match(/.{1,4}/g)?.join(" ")}...</code>
-                </div>
-                {confirming === t.fingerprint ? (
+                {renaming === t.fingerprint ? (
+                  <form className="rename" onSubmit={(e) => rename(e, t.fingerprint)}>
+                    <label>
+                      <span className="visually-hidden">New name for {t.name}</span>
+                      <input value={newName} onChange={(e) => setNewName(e.target.value)} maxLength={64} required autoFocus />
+                    </label>
+                    <button className="btn primary" type="submit">
+                      Save
+                    </button>
+                    <button className="btn tertiary" type="button" onClick={() => setRenaming(null)}>
+                      Cancel
+                    </button>
+                  </form>
+                ) : (
+                  <div className="trusted-text">
+                    <strong>{t.name}</strong>
+                    <code className="caption">{t.fingerprint.slice(0, 19).match(/.{1,4}/g)?.join(" ")}...</code>
+                    <label className="switch small">
+                      <input
+                        type="checkbox"
+                        checked={t.auto_accept}
+                        onChange={(e) => api.setAutoAccept(t.fingerprint, e.target.checked).then(props.onChanged).catch((err) => setError(String(err)))}
+                      />
+                      <span className="switch-track" aria-hidden />
+                      Accept files from {t.name} without asking
+                    </label>
+                  </div>
+                )}
+                {renaming !== t.fingerprint && confirming !== t.fingerprint && (
+                  <button
+                    className="btn tertiary"
+                    aria-label={`Rename ${t.name}`}
+                    onClick={() => {
+                      setRenaming(t.fingerprint);
+                      setNewName(t.name);
+                    }}
+                  >
+                    <Pencil size={16} aria-hidden />
+                    Rename
+                  </button>
+                )}
+                {renaming === t.fingerprint ? null : confirming === t.fingerprint ? (
                   <div className="confirm" role="group" aria-label={`Remove ${t.name}?`}>
                     <button className="btn destructive" onClick={() => remove(t.fingerprint)}>
                       Remove {t.name}
@@ -897,17 +1157,54 @@ function QrImage({ offer }: { offer: PairingOffer }) {
   );
 }
 
-function SettingsView({ me, clipSync, setClipSync }: { me: Me; clipSync: boolean; setClipSync: (on: boolean) => void }) {
+function SettingsView(props: {
+  me: Me;
+  clipSync: boolean;
+  setClipSync: (on: boolean) => void;
+  onDownloadsChanged: () => void;
+}) {
+  const { me, clipSync, setClipSync } = props;
   const [theme, setThemeState] = useState<ThemePreference>(savedTheme());
+  const [autostart, setAutostartState] = useState(false);
+  const [menu, setMenuState] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    api.autostart().then(setAutostartState);
+    api.explorerMenu().then(setMenuState);
+  }, []);
   const choose = (t: ThemePreference) => {
     setThemeState(t);
     setTheme(t);
+  };
+  const toggle = (set: (on: boolean) => Promise<void>, apply: (on: boolean) => void) => (on: boolean) =>
+    set(on)
+      .then(() => {
+        apply(on);
+        setError(null);
+      })
+      .catch((e) => setError(String(e)));
+  const changeFolder = async () => {
+    const picked = await open({ directory: true, defaultPath: me.downloads });
+    if (typeof picked !== "string") return;
+    api
+      .setDownloads(picked)
+      .then(() => {
+        setError(null);
+        props.onDownloadsChanged();
+      })
+      .catch((e) => setError(String(e)));
   };
   return (
     <>
       <header className="page-head">
         <h1>Settings</h1>
       </header>
+      {error && (
+        <p className="notice error" role="alert">
+          <CircleAlert size={16} aria-hidden />
+          {error}
+        </p>
+      )}
       <section className="panel" aria-labelledby="clip-title">
         <h2 id="clip-title">Clipboard</h2>
         <label className="switch">
@@ -916,8 +1213,25 @@ function SettingsView({ me, clipSync, setClipSync }: { me: Me; clipSync: boolean
           Sync clipboard with paired devices
         </label>
         <p className="caption">
-          Text you copy goes to paired devices nearby, and text copied there comes here. Only text, over the
-          encrypted connection. RustDrop keeps no history. Turn it on on each device that should take part.
+          Text and images you copy go to paired devices nearby, and what is copied there comes here, over the
+          encrypted connection. Ferrydrop keeps no history of it. Turn it on on each device that should take part.
+        </p>
+      </section>
+      <section className="panel" aria-labelledby="win-title">
+        <h2 id="win-title">Windows</h2>
+        <label className="switch">
+          <input type="checkbox" checked={autostart} onChange={(e) => toggle(api.setAutostart, setAutostartState)(e.target.checked)} />
+          <span className="switch-track" aria-hidden />
+          Start Ferrydrop when you sign in
+        </label>
+        <label className="switch">
+          <input type="checkbox" checked={menu} onChange={(e) => toggle(api.setExplorerMenu, setMenuState)(e.target.checked)} />
+          <span className="switch-track" aria-hidden />
+          Show "Send with Ferrydrop" when you right-click files and folders
+        </label>
+        <p className="caption">
+          Closing the window keeps Ferrydrop in the tray, so paired devices can still send to this PC. Quit it from
+          the tray icon. On Windows 11, the Explorer item is under "Show more options".
         </p>
       </section>
       <section className="panel" aria-labelledby="theme-title">
@@ -934,10 +1248,15 @@ function SettingsView({ me, clipSync, setClipSync }: { me: Me; clipSync: boolean
       <section className="panel" aria-labelledby="dl-title">
         <h2 id="dl-title">Received files</h2>
         <p className="path">{me.downloads}</p>
-        <button className="btn secondary" onClick={() => api.openDownloads()}>
-          <Folder size={16} aria-hidden />
-          Open folder
-        </button>
+        <div className="actions">
+          <button className="btn secondary" onClick={() => api.openDownloads()}>
+            <Folder size={16} aria-hidden />
+            Open folder
+          </button>
+          <button className="btn tertiary" onClick={changeFolder}>
+            Change folder
+          </button>
+        </div>
       </section>
       <section className="panel" aria-labelledby="about-title">
         <h2 id="about-title">This device</h2>

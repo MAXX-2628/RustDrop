@@ -19,7 +19,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Wire protocol version advertised during discovery and HELLO.
 /// 2: file data is framed so either side can cancel mid-transfer.
 /// 3: chunked data over parallel connections, resume of broken transfers, decline reasons.
-pub const PROTOCOL_VERSION: u16 = 3;
+/// 4: pause, links/text (TEXT), clipboard images (SEND_REQUEST.clipboard).
+pub const PROTOCOL_VERSION: u16 = 4;
 
 #[cfg(test)]
 mod tests {
@@ -27,6 +28,6 @@ mod tests {
 
     #[test]
     fn version_matches_manifest() {
-        assert_eq!(VERSION, "0.1.0");
+        assert_eq!(VERSION, "0.2.0");
     }
 }

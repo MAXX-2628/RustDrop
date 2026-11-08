@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.Bundle
+import androidx.core.net.toUri
 import app.rustdrop.core.IncomingRequest
 import app.rustdrop.core.TransferState
 
@@ -26,7 +27,7 @@ object Notifications {
         ctx.getSystemService(NotificationManager::class.java).createNotificationChannels(
             listOf(
                 NotificationChannel(CH_TRANSFERS, "Transfers in progress", NotificationManager.IMPORTANCE_LOW).apply {
-                    description = "Progress while RustDrop sends or receives files"
+                    description = "Progress while Ferrydrop sends or receives files"
                 },
                 NotificationChannel(CH_REQUESTS, "Incoming files", NotificationManager.IMPORTANCE_HIGH).apply {
                     description = "A paired device wants to send you files"
@@ -86,7 +87,7 @@ object Notifications {
         val n = Notification.Builder(ctx, CH_REQUESTS)
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setContentTitle("${request.sender} wants to send you ${if (count == 1) "a file" else "$count files"}")
-            .setContentText("Open RustDrop to see the files and accept.")
+            .setContentText("Open Ferrydrop to see the files and accept.")
             .setCategory(Notification.CATEGORY_CALL)
             .setContentIntent(openApp(ctx))
             .setAutoCancel(true)
@@ -115,15 +116,55 @@ object Notifications {
         post(ctx, t.id.hashCode(), n)
     }
 
+    /** A link or text a paired device sent on purpose: Open (links only) and Copy. Never opened by itself. */
+    fun text(ctx: Context, text: String, from: String) {
+        val link = isLink(text)
+        val copy = PendingIntent.getBroadcast(
+            ctx, ("copy" + text).hashCode(),
+            Intent(ctx, ActionReceiver::class.java).setAction(ACTION_COPY).putExtra(EXTRA_TEXT, text),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        val b = Notification.Builder(ctx, CH_REQUESTS)
+            .setSmallIcon(android.R.drawable.stat_notify_chat)
+            .setContentTitle("$from sent you ${if (link) "a link" else "text"}")
+            .setContentText(text.take(200))
+            .setStyle(Notification.BigTextStyle().bigText(text.take(1000)))
+            .setContentIntent(openApp(ctx))
+            .setAutoCancel(true)
+            .addAction(Notification.Action.Builder(null, "Copy", copy).build())
+        if (link) {
+            val open = PendingIntent.getActivity(
+                ctx, text.hashCode(),
+                Intent(Intent.ACTION_VIEW, text.toUri()).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+                PendingIntent.FLAG_IMMUTABLE,
+            )
+            b.addAction(Notification.Action.Builder(null, "Open", open).build())
+        }
+        post(ctx, ("text" + text).hashCode(), b.build())
+    }
+
+    const val ACTION_COPY = "app.rustdrop.COPY"
+    const val EXTRA_TEXT = "text"
+
     private fun post(ctx: Context, id: Int, n: Notification) {
         // Throws or is ignored when notifications are not allowed; the in-app island still shows it.
         runCatching { ctx.getSystemService(NotificationManager::class.java).notify(id, n) }
     }
 }
 
-/** Cancel / Decline buttons in notifications. Not exported: only our own PendingIntents reach it. */
+/** Only plain web links get an Open button; anything else is just text to copy. */
+fun isLink(text: String) =
+    (text.startsWith("https://") || text.startsWith("http://")) && text.length < 4096 && text.none { it.isWhitespace() || it == '"' }
+
+/** Cancel / Decline / Copy buttons in notifications. Not exported: only our own PendingIntents reach it. */
 class ActionReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
+        if (intent.action == Notifications.ACTION_COPY) {
+            val text = intent.getStringExtra(Notifications.EXTRA_TEXT) ?: return
+            context.getSystemService(android.content.ClipboardManager::class.java)
+                .setPrimaryClip(android.content.ClipData.newPlainText("Ferrydrop", text))
+            return
+        }
         val id = intent.getStringExtra(Notifications.EXTRA_ID) ?: return
         if (!Core.started) return
         when (intent.action) {

@@ -4,12 +4,20 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "ferrydrop"
+path = "src/main.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
 rustdrop-core = { path = "../../rust-core" }
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "=2.8.3"
 tauri-plugin-notification = "=2.7.0"
-arboard = { version = "=3.7.0", default-features = false }
+tauri-plugin-single-instance = "=2.5.4"
+arboard = { version = "=3.7.0", default-features = false, features = ["image-data"] }
+# Same version and features arboard's image support already pulls in; used to encode/decode clipboard PNGs.
+image = { version = "0.25", default-features = false, features = ["png"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Registry", "Win32_System_DataExchange"] }

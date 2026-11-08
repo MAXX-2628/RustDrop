@@ -14,11 +14,11 @@ android {
     compileSdk = 37
 
     defaultConfig {
-        applicationId = "app.rustdrop"
+        applicationId = "app.ferrydrop" // renamed from RustDrop; the Kotlin namespace stays app.rustdrop
         minSdk = 29 // MediaStore.Downloads with RELATIVE_PATH, no storage permission needed
         targetSdk = 37
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 2
+        versionName = "0.2.0"
         ndk { abiFilters += abis }
     }
 

@@ -108,6 +108,9 @@ pub struct TrustedDevice {
     /// (for example across Wi-Fi and wired subnets). Absent in files from older versions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub addr: Option<String>,
+    /// The user chose to accept every transfer from this device without asking.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub auto_accept: bool,
 }
 
 /// Fingerprint -> trusted device, persisted as `trusted.json`.
@@ -141,31 +144,41 @@ impl TrustStore {
             "fingerprint must be 64 hex characters"
         );
         let mut devices = self.devices.write().unwrap();
-        let addr = devices.get(&fingerprint).and_then(|d| d.addr.clone());
-        devices.insert(
-            fingerprint,
-            TrustedDevice {
-                name: name.into(),
-                addr,
-            },
-        );
+        // Re-pairing renames; the address and auto-accept choice are kept.
+        let device = devices.entry(fingerprint).or_insert(TrustedDevice {
+            name: String::new(),
+            addr: None,
+            auto_accept: false,
+        });
+        device.name = name.into();
         crate::disk::write_atomic(&self.path, &serde_json::to_vec_pretty(&*devices)?)?;
+        Ok(())
+    }
+
+    /// Changes a known device and saves, only if `change` returns true. Unknown fingerprints are ignored.
+    pub fn update(
+        &self,
+        fingerprint: &str,
+        change: impl FnOnce(&mut TrustedDevice) -> bool,
+    ) -> Result<()> {
+        let mut devices = self.devices.write().unwrap();
+        let Some(device) = devices.get_mut(fingerprint) else {
+            return Ok(());
+        };
+        if change(device) {
+            crate::disk::write_atomic(&self.path, &serde_json::to_vec_pretty(&*devices)?)?;
+        }
         Ok(())
     }
 
     /// Remembers where a trusted device listens. Unknown fingerprints are ignored.
     pub fn set_addr(&self, fingerprint: &str, addr: SocketAddr) -> Result<()> {
-        let mut devices = self.devices.write().unwrap();
-        let Some(device) = devices.get_mut(fingerprint) else {
-            return Ok(());
-        };
         let addr = addr.to_string();
-        if device.addr.as_deref() == Some(addr.as_str()) {
-            return Ok(());
-        }
-        device.addr = Some(addr);
-        crate::disk::write_atomic(&self.path, &serde_json::to_vec_pretty(&*devices)?)?;
-        Ok(())
+        self.update(fingerprint, |d| {
+            let changed = d.addr.as_deref() != Some(addr.as_str());
+            d.addr = Some(addr);
+            changed
+        })
     }
 
     /// Revokes trust; the device's next handshake is rejected.

@@ -37,7 +37,7 @@ async fn main() -> Result<()> {
 
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["id"] => {
-            println!("RustDrop core v{VERSION} (protocol {PROTOCOL_VERSION})");
+            println!("Ferrydrop core v{VERSION} (protocol {PROTOCOL_VERSION})");
             println!("name:        {}", identity.name);
             println!("id:          {}", identity.id);
             println!("fingerprint: {}", identity.fingerprint());
@@ -99,7 +99,7 @@ async fn run(identity: Arc<Identity>, trust: Arc<TrustStore>) -> Result<()> {
         tokio::spawn(async move {
             for addr in &addrs {
                 match server::ping(*addr, &identity, trust.clone()).await {
-                    Ok((info, rtt)) => {
+                    Ok((info, rtt, _)) => {
                         println!("PONG from {} in {rtt:?} (encrypted, trusted)", info.name);
                         return;
                     }
@@ -155,6 +155,8 @@ async fn show_events(mut events: mpsc::Receiver<Event>) {
             Event::Paired { name } => println!("\npaired with {name}"),
             Event::Cancelled { .. } => println!("\ntransfer cancelled"),
             Event::Clipboard { .. } => {} // the CLI does not sync the clipboard
+            Event::Text { text, from } => println!("\n{from} sent: {text}"),
+            Event::Paused { .. } => println!("\ntransfer paused by the sender"),
         }
     }
 }
@@ -205,6 +207,7 @@ async fn send(
             reason: Some(reason),
         } => println!("{name} declined: {reason}"),
         Outcome::Cancelled { .. } => println!("\n{name} cancelled the transfer"),
+        Outcome::Paused => println!("\npaused"),
     }
     Ok(())
 }

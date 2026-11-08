@@ -90,7 +90,15 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.rustdrop.ACTIVE
 import app.rustdrop.Core
+import app.rustdrop.ReceivedText
 import app.rustdrop.Transfer
+import app.rustdrop.isLink
+import com.composables.icons.lucide.ExternalLink
+import com.composables.icons.lucide.Link
+import com.composables.icons.lucide.Pause
+import com.composables.icons.lucide.Pencil
+import com.composables.icons.lucide.Play
+import com.composables.icons.lucide.Trash2
 import app.rustdrop.core.IncomingRequest
 import app.rustdrop.core.Me
 import app.rustdrop.core.PairingOffer
@@ -126,6 +134,18 @@ enum class PickKind { Media, Files, Folder }
 class Actions(
     val pick: (PickKind, String?) -> Unit,
     val send: (String, List<app.rustdrop.Outgoing>) -> Unit,
+    val sendAll: (List<String>, List<app.rustdrop.Outgoing>) -> Unit,
+    val stageText: (String) -> Unit,
+    val sendText: (List<String>, String) -> Unit,
+    val dismissText: (ReceivedText) -> Unit,
+    val openLink: (String) -> Unit,
+    val copyText: (String) -> Unit,
+    val pause: (String) -> Unit,
+    val resume: (String) -> Unit,
+    val clearHistory: () -> Unit,
+    /** Returns an error message, or null on success. */
+    val rename: (String, String) -> String?,
+    val setAutoAccept: (String, Boolean) -> Unit,
     val clearStaged: () -> Unit,
     val refresh: () -> Unit,
     val cancel: (String) -> Unit,
@@ -179,7 +199,7 @@ fun RustDropUi(actions: Actions) {
         },
     ) { padding ->
         Column(Modifier.padding(padding).fillMaxSize()) {
-            fatal?.let { Banner("RustDrop can't receive files right now: $it", Modifier.padding(sp.lg)) }
+            fatal?.let { Banner("Ferrydrop can't receive files right now: $it", Modifier.padding(sp.lg)) }
             when (tab) {
                 Tab.Home -> HomeScreen(
                     me = me,
@@ -219,6 +239,9 @@ private fun HomeScreen(
 ) {
     val sp = LocalSpacing.current
     val palette = LocalPalette.current
+    val texts by Core.texts.collectAsStateWithLifecycle()
+    val stagedTextState by Core.stagedText.collectAsStateWithLifecycle()
+    val stagedText = stagedTextState
     var searching by remember { mutableStateOf(true) }
     LaunchedEffect(Unit) {
         delay(4000)
@@ -239,22 +262,32 @@ private fun HomeScreen(
                 ClipboardStatus(actions)
             }
         }
+        if (texts.isNotEmpty()) items(texts, key = { "text-${it.at}" }) { ReceivedTextCard(it, actions) }
         item { SendActions(actions, null) }
         if (preparing) item { StatusLine(Lucide.Clock, "Preparing files...") }
-        if (staged.isNotEmpty()) {
+        if (staged.isNotEmpty() || stagedText != null) {
             item {
-                Row(
+                val paired = peers.filter { it.trusted == true }.map { it.id }
+                Column(
                     Modifier.fillMaxWidth()
                         .border(1.dp, palette.primary, RoundedCornerShape(LocalRadius.current.card))
                         .padding(start = sp.lg, end = sp.xs, top = sp.xs, bottom = sp.xs),
-                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Icon(Lucide.Files, contentDescription = null)
-                    Text(
-                        "${plural(staged.size, "item")} ready. Tap a device to send ${if (staged.size == 1) "it" else "them"}.",
-                        Modifier.weight(1f).padding(horizontal = sp.md),
-                    )
-                    TextButton(onClick = actions.clearStaged) { Text("Clear") }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(if (stagedText != null) Lucide.Link else Lucide.Files, contentDescription = null)
+                        Text(
+                            stagedText?.let { "\"${it.take(60)}${if (it.length > 60) "..." else ""}\" ready. Tap a device to send it." }
+                                ?: "${plural(staged.size, "item")} ready. Tap a device to send ${if (staged.size == 1) "it" else "them"}.",
+                            Modifier.weight(1f).padding(horizontal = sp.md),
+                        )
+                        TextButton(onClick = actions.clearStaged) { Text("Clear") }
+                    }
+                    if (paired.size > 1) {
+                        TextButton(onClick = {
+                            val text = stagedText
+                            if (text != null) actions.sendText(paired, text) else actions.sendAll(paired, staged)
+                        }) { Text("Send to all ${paired.size} paired") }
+                    }
                 }
             }
         }
@@ -278,7 +311,7 @@ private fun HomeScreen(
                     Empty(
                         Lucide.Smartphone,
                         "No devices nearby",
-                        "Make sure both devices are connected to the same network and RustDrop is running.",
+                        "Make sure both devices are connected to the same network and Ferrydrop is running.",
                     ) {
                         OutlinedButton(onClick = actions.refresh) { Text("Refresh") }
                     }
@@ -290,6 +323,7 @@ private fun HomeScreen(
                     when {
                         peer.trusted == false -> onPairDevice(peer.name)
                         peer.trusted == null -> Unit
+                        stagedText != null -> actions.sendText(listOf(peer.id), stagedText)
                         staged.isNotEmpty() -> actions.send(peer.id, staged)
                         else -> actions.pick(PickKind.Files, peer.id)
                     }
@@ -314,6 +348,29 @@ private fun HomeScreen(
 private fun SendActions(actions: Actions, device: String?) {
     val sp = LocalSpacing.current
     var menu by remember { mutableStateOf(false) }
+    var composing by remember { mutableStateOf(false) }
+    if (composing) {
+        var draft by rememberSaveable { mutableStateOf("") }
+        AlertDialog(
+            onDismissRequest = { composing = false },
+            title = { Text("Send a link or text") },
+            text = {
+                OutlinedTextField(
+                    value = draft,
+                    onValueChange = { draft = it.take(65536) },
+                    label = { Text("Link or text") },
+                    minLines = 2,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            },
+            confirmButton = {
+                TextButton(enabled = draft.isNotBlank(), onClick = { actions.stageText(draft); composing = false }) {
+                    Text("Choose a device")
+                }
+            },
+            dismissButton = { TextButton(onClick = { composing = false }) { Text("Cancel") } },
+        )
+    }
     Row(horizontalArrangement = Arrangement.spacedBy(sp.md)) {
         Box(Modifier.weight(1f)) {
             Button(onClick = { menu = true }, modifier = Modifier.fillMaxWidth().heightIn(min = 56.dp)) {
@@ -337,12 +394,48 @@ private fun SendActions(actions: Actions, device: String?) {
                     leadingIcon = { Icon(Lucide.Folder, contentDescription = null) },
                     onClick = { menu = false; actions.pick(PickKind.Folder, device) },
                 )
+                DropdownMenuItem(
+                    text = { Text("A link or text") },
+                    leadingIcon = { Icon(Lucide.Link, contentDescription = null) },
+                    onClick = { menu = false; composing = true },
+                )
             }
         }
         OutlinedButton(onClick = actions.openDownloads, modifier = Modifier.weight(1f).heightIn(min = 56.dp)) {
             Icon(Lucide.Download, contentDescription = null)
             Spacer(Modifier.width(sp.sm))
             Text("Received")
+        }
+    }
+}
+
+/** A link or text another device sent: Open (web links only), Copy, dismiss. */
+@Composable
+private fun ReceivedTextCard(t: ReceivedText, actions: Actions) {
+    val sp = LocalSpacing.current
+    val palette = LocalPalette.current
+    Column(
+        Modifier.fillMaxWidth()
+            .background(palette.surface, RoundedCornerShape(LocalRadius.current.card))
+            .padding(start = sp.lg, end = sp.xs, top = sp.md, bottom = sp.xs),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(sp.md)) {
+            Icon(Lucide.Link, contentDescription = null, tint = palette.primary)
+            Column(Modifier.weight(1f)) {
+                Text("From ${t.from}", style = MaterialTheme.typography.bodySmall, color = palette.textSecondary)
+                Text(t.text, maxLines = 3, overflow = TextOverflow.Ellipsis)
+            }
+        }
+        Row(Modifier.align(Alignment.End)) {
+            if (isLink(t.text)) {
+                TextButton(onClick = { actions.openLink(t.text); actions.dismissText(t) }) {
+                    Icon(Lucide.ExternalLink, contentDescription = null, Modifier.size(16.dp))
+                    Spacer(Modifier.width(sp.sm))
+                    Text("Open")
+                }
+            }
+            TextButton(onClick = { actions.copyText(t.text); actions.dismissText(t) }) { Text("Copy") }
+            TextButton(onClick = { actions.dismissText(t) }) { Text("Dismiss") }
         }
     }
 }
@@ -393,10 +486,29 @@ private fun DeviceRow(peer: PeerInfo, onClick: () -> Unit) {
 @Composable
 private fun ActivityScreen(transfers: List<Transfer>, actions: Actions) {
     val sp = LocalSpacing.current
+    var confirming by remember { mutableStateOf(false) }
     LazyColumn(contentPadding = PaddingValues(sp.xl), verticalArrangement = Arrangement.spacedBy(sp.md)) {
-        item { Text("Activity", style = MaterialTheme.typography.headlineMedium, modifier = Modifier.semantics { heading() }) }
+        item {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Activity", style = MaterialTheme.typography.headlineMedium, modifier = Modifier.weight(1f).semantics { heading() })
+                if (transfers.any { it.state !in ACTIVE && it.state != TransferState.PAUSED }) {
+                    if (confirming) {
+                        TextButton(onClick = { actions.clearHistory(); confirming = false }) {
+                            Text("Clear history", color = LocalPalette.current.error)
+                        }
+                        TextButton(onClick = { confirming = false }) { Text("Keep") }
+                    } else {
+                        TextButton(onClick = { confirming = true }) {
+                            Icon(Lucide.Trash2, contentDescription = null, Modifier.size(16.dp))
+                            Spacer(Modifier.width(sp.sm))
+                            Text("Clear")
+                        }
+                    }
+                }
+            }
+        }
         if (transfers.isEmpty()) {
-            item { Empty(Lucide.History, "Nothing shared yet", "Your recent transfers will appear here.") }
+            item { Empty(Lucide.History, "Nothing shared yet", "Your transfers will appear here. Ferrydrop keeps the last 200, never the files themselves.") }
         } else {
             items(transfers, key = { it.id }) { TransferRow(it, actions) }
         }
@@ -412,7 +524,14 @@ private fun TransferRow(t: Transfer, actions: Actions) {
     val speed = if (seconds > 0.5) t.done / seconds else 0.0
     val left = if (speed > 0) (t.total - t.done) / speed else null
     val title = if (t.outgoing) "To ${t.peer}" else "From ${t.peer}"
-    val size = if (t.total > 0) "${plural(t.items.toInt(), "item")}, ${formatBytes(t.total.toDouble())}" else plural(t.items.toInt(), "item")
+    val what = when {
+        t.name.isEmpty() -> plural(t.items.toInt(), "item")
+        t.items > 1 -> "${t.name} +${t.items - 1}"
+        else -> t.name
+    }
+    val size = if (t.total > 0) "$what, ${formatBytes(t.total.toDouble())}" else what
+    val `when` = if (t.state in ACTIVE) "" else
+        java.text.DateFormat.getDateTimeInstance(java.text.DateFormat.MEDIUM, java.text.DateFormat.SHORT).format(java.util.Date(t.startedAt))
 
     val (icon, color) = when (t.state) {
         TransferState.WAITING_FOR_ACCEPT -> Lucide.Clock to palette.warning
@@ -420,6 +539,7 @@ private fun TransferRow(t: Transfer, actions: Actions) {
         TransferState.COMPLETED -> Lucide.CircleCheck to palette.success
         TransferState.FAILED -> Lucide.CircleAlert to palette.error
         TransferState.CANCELLED -> Lucide.X to palette.textSecondary
+        TransferState.PAUSED -> Lucide.Pause to palette.warning
     }
     val status = when (t.state) {
         TransferState.WAITING_FOR_ACCEPT -> if (t.outgoing) "Waiting for ${t.peer} to accept" else "Waiting for you to accept"
@@ -429,10 +549,11 @@ private fun TransferRow(t: Transfer, actions: Actions) {
             left?.let { append(", ${formatDuration(it)} left") }
         }
         TransferState.VERIFYING -> "Verifying files"
-        TransferState.COMPLETED -> if (t.outgoing) "Sent and verified" else "Received and verified. Saved to Downloads/RustDrop."
+        TransferState.COMPLETED -> if (t.outgoing) "Sent and verified" else "Received and verified. Saved to Downloads/Ferrydrop."
         TransferState.FAILED -> t.reason?.let { "Transfer failed. $it" } ?: "Transfer failed"
         TransferState.CANCELLED -> t.reason ?: "Cancelled"
-    }
+        TransferState.PAUSED -> if (t.outgoing) "Paused. Resume continues where it stopped." else t.reason ?: "Paused"
+    }.let { if (`when`.isEmpty()) it else "$it. ${`when`}" }
 
     Column(
         Modifier.fillMaxWidth()
@@ -461,7 +582,25 @@ private fun TransferRow(t: Transfer, actions: Actions) {
                 color = if (t.state == TransferState.FAILED) palette.error else palette.textSecondary,
                 modifier = Modifier.weight(1f),
             )
-            if (t.state in ACTIVE && (t.outgoing || t.state != TransferState.WAITING_FOR_ACCEPT)) {
+        }
+        Row(Modifier.align(Alignment.End)) {
+            if (t.outgoing && t.state == TransferState.TRANSFERRING) {
+                TextButton(onClick = { actions.pause(t.id) }) {
+                    Icon(Lucide.Pause, contentDescription = null, Modifier.size(16.dp))
+                    Spacer(Modifier.width(sp.sm))
+                    Text("Pause")
+                }
+            }
+            if (t.outgoing && t.state == TransferState.PAUSED) {
+                TextButton(onClick = { actions.resume(t.id) }) {
+                    Icon(Lucide.Play, contentDescription = null, Modifier.size(16.dp))
+                    Spacer(Modifier.width(sp.sm))
+                    Text("Resume")
+                }
+            }
+            if ((t.state in ACTIVE && (t.outgoing || t.state != TransferState.WAITING_FOR_ACCEPT)) ||
+                (t.outgoing && t.state == TransferState.PAUSED)
+            ) {
                 TextButton(onClick = { actions.cancel(t.id) }) { Text("Cancel") }
             }
             if (!t.outgoing && t.state == TransferState.COMPLETED) {
@@ -696,6 +835,7 @@ private fun SettingsScreen(
     var fingerprint by rememberSaveable { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
     var confirming by remember { mutableStateOf<String?>(null) }
+    var renaming by remember { mutableStateOf<String?>(null) }
     var copied by remember { mutableStateOf(false) }
     LaunchedEffect(copied) {
         if (copied) {
@@ -774,11 +914,37 @@ private fun SettingsScreen(
                     Text("No paired devices yet. Pair a device above to start sharing.", color = palette.textSecondary)
                 }
                 trusted.forEach { t ->
+                    if (renaming == t.fingerprint) {
+                        var name by rememberSaveable(t.fingerprint) { mutableStateOf(t.name) }
+                        var renameError by remember { mutableStateOf<String?>(null) }
+                        OutlinedTextField(
+                            value = name,
+                            onValueChange = { name = it.take(64) },
+                            label = { Text("New name for ${t.name}") },
+                            singleLine = true,
+                            isError = renameError != null,
+                            supportingText = renameError?.let { { Text(it) } },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(sp.sm)) {
+                            Button(onClick = {
+                                renameError = actions.rename(t.fingerprint, name)
+                                if (renameError == null) renaming = null
+                            }) { Text("Save") }
+                            TextButton(onClick = { renaming = null }) { Text("Cancel") }
+                        }
+                        return@forEach
+                    }
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(sp.md)) {
                         Icon(Lucide.ShieldCheck, contentDescription = null, tint = palette.success)
                         Column(Modifier.weight(1f)) {
                             Text(t.name, fontWeight = FontWeight.SemiBold)
                             Text(t.fingerprint.take(16).chunked(4).joinToString(" ") + "...", style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace, color = palette.textSecondary)
+                        }
+                        if (confirming != t.fingerprint) {
+                            TextButton(onClick = { renaming = t.fingerprint }) {
+                                Icon(Lucide.Pencil, contentDescription = "Rename ${t.name}", Modifier.size(16.dp))
+                            }
                         }
                         if (confirming == t.fingerprint) {
                             OutlinedButton(
@@ -789,6 +955,14 @@ private fun SettingsScreen(
                         } else {
                             TextButton(onClick = { confirming = t.fingerprint }) { Text("Remove") }
                         }
+                    }
+                    Row(
+                        Modifier.fillMaxWidth().heightIn(min = 48.dp)
+                            .toggleable(value = t.autoAccept, onValueChange = { on -> actions.setAutoAccept(t.fingerprint, on) }, role = Role.Switch),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text("Accept files from ${t.name} without asking", Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                        Switch(checked = t.autoAccept, onCheckedChange = null)
                     }
                 }
             }
@@ -822,7 +996,7 @@ private fun SettingsScreen(
 
         item {
             Panel("This device") {
-                Text("Received files are saved to Downloads/RustDrop.", color = palette.textSecondary)
+                Text("Received files are saved to Downloads/Ferrydrop.", color = palette.textSecondary)
                 Text("Name: ${me.name}")
                 Text("Version: ${me.version}", color = palette.textSecondary)
             }
@@ -857,7 +1031,7 @@ private fun ClipboardSettings(actions: Actions) {
             Switch(checked = on, onCheckedChange = null)
         }
         Text(
-            "Text you copy goes to paired devices nearby, and text copied there comes here. Android only lets RustDrop read the clipboard while it is open. Only text, nothing is stored.",
+            "Text and images you copy go to paired devices nearby, and what is copied there comes here. Android only lets Ferrydrop read the clipboard while it is open. Nothing is stored.",
             style = MaterialTheme.typography.bodySmall,
             color = LocalPalette.current.textSecondary,
         )
@@ -880,7 +1054,7 @@ private fun QrPairing(actions: Actions) {
         val shown = offer
         if (shown == null) {
             Text(
-                "Scan the code another RustDrop device shows, or show yours. Both devices are paired in one step. They need to be on the same network.",
+                "Scan the code another Ferrydrop device shows, or show yours. Both devices are paired in one step. They need to be on the same network.",
                 style = MaterialTheme.typography.bodySmall,
                 color = palette.textSecondary,
             )
@@ -906,7 +1080,7 @@ private fun QrPairing(actions: Actions) {
                 actions.hideQr()
             }
             QrImage(shown, Modifier.align(Alignment.CenterHorizontally))
-            Text("On the other device, open RustDrop and scan this code.")
+            Text("On the other device, open Ferrydrop and scan this code.")
             Text(
                 "The code works once and expires in ${secondsLeft / 60}:${(secondsLeft % 60).toString().padStart(2, '0')}.",
                 style = MaterialTheme.typography.bodySmall,

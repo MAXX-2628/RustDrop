@@ -12,6 +12,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -25,9 +26,10 @@ use uuid::Uuid;
 use crate::{
     discovery,
     identity::Identity,
+    protocol::Message,
     security::{PairingWindow, TrustStore},
     server,
-    transfer::{self, Event, Inbox, Outcome, TransferState},
+    transfer::{self, Event, Inbox, Outcome, SendOptions, Source, TransferState},
     VERSION,
 };
 
@@ -59,6 +61,8 @@ pub struct Me {
 pub struct TrustedInfo {
     pub fingerprint: String,
     pub name: String,
+    /// Transfers from this device start without asking.
+    pub auto_accept: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -90,6 +94,8 @@ pub struct TransferUpdate {
     pub id: String,
     pub outgoing: Option<bool>,
     pub peer: Option<String>,
+    /// Name of the first file or folder, for lists and history.
+    pub name: Option<String>,
     pub items: Option<u64>,
     pub total: Option<u64>,
     pub done: Option<u64>,
@@ -97,6 +103,29 @@ pub struct TransferUpdate {
     pub reason: Option<String>,
     pub saved: Option<Vec<String>>,
 }
+
+/// A finished (or paused) transfer, kept in `history.json` across restarts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[cfg_attr(feature = "uniffi", derive(uniffi::Record))]
+pub struct HistoryEntry {
+    pub id: String,
+    pub outgoing: bool,
+    pub peer: String,
+    pub name: String,
+    pub items: u64,
+    pub total: u64,
+    pub state: TransferState,
+    pub reason: Option<String>,
+    pub saved: Vec<String>,
+    /// Unix seconds.
+    pub finished: u64,
+}
+
+/// Transfers kept in history; older ones are dropped.
+const HISTORY_MAX: usize = 200;
+/// Largest clipboard image synced (PNG bytes).
+pub const MAX_CLIPBOARD_IMAGE: u64 = 32 << 20;
 
 /// A QR pairing code to show: `modules` holds `size` x `size` cells, row by row, true = dark.
 #[derive(Debug, Clone, Serialize)]
@@ -137,6 +166,12 @@ pub trait Listener: Send + Sync {
     /// Clipboard text arrived from the paired device `from`; put it on the system clipboard.
     /// Only called while clipboard sync is on. Never log `text`.
     fn clipboard_received(&self, text: String, from: String);
+    /// A PNG image copied on `from` arrived at `path`; put it on the clipboard, then delete the file.
+    /// Only called while clipboard sync is on.
+    fn clipboard_image_received(&self, path: String, from: String);
+    /// The paired device `from` sent a link or text on purpose. Show it with Open (for http/https
+    /// links) and Copy; never open it without the user asking.
+    fn text_received(&self, text: String, from: String);
     /// A device finished QR pairing with this one (it scanned this device's code).
     fn paired(&self, name: String);
     /// The node stopped working (for example, it could not open a network socket).
@@ -160,15 +195,28 @@ struct Peer {
     addr: SocketAddr,
 }
 
+/// A running send: raise the watch to stop it; set the flag first to pause instead.
+type Running = (watch::Sender<bool>, Arc<AtomicBool>);
+
+/// An outgoing transfer the user paused: what to send again, and to whom.
+struct PausedSend {
+    device: Uuid,
+    sources: Vec<Source>,
+}
+
 struct Inner {
     identity: Arc<Identity>,
     trust: Arc<TrustStore>,
-    downloads: PathBuf,
+    downloads: Mutex<PathBuf>,
     listener: Arc<dyn Listener>,
     rt: Handle,
     peers: Mutex<HashMap<Uuid, Peer>>,
     pending: Mutex<HashMap<Uuid, oneshot::Sender<bool>>>,
-    sends: Mutex<HashMap<Uuid, watch::Sender<bool>>>,
+    /// Running sends: raise the watch to stop; set the flag first to pause instead of cancel.
+    sends: Mutex<HashMap<Uuid, Running>>,
+    paused: Mutex<HashMap<Uuid, PausedSend>>,
+    /// Incoming clipboard images in flight (never shown as transfers): id -> sender label.
+    silent: Mutex<HashMap<Uuid, String>>,
     inbox: Mutex<Option<Arc<Inbox>>>,
     error: Mutex<Option<String>>,
     pairing: Arc<PairingWindow>,
@@ -177,9 +225,15 @@ struct Inner {
     discover: AtomicBool,
     discovery: Mutex<Option<Discovery>>,
     settings_path: PathBuf,
+    settings: Mutex<Settings>,
     clipboard_sync: AtomicBool,
     /// SHA-256 of the last clipboard text sent or received: stops echoes between devices.
     last_clip: Mutex<Option<Vec<u8>>>,
+    /// What is known so far about each unfinished transfer, merged from its updates.
+    live: Mutex<HashMap<String, HistoryEntry>>,
+    history_path: PathBuf,
+    /// Newest first.
+    history: Mutex<Vec<HistoryEntry>>,
 }
 
 #[cfg_attr(feature = "uniffi", derive(uniffi::Object))]
@@ -194,6 +248,15 @@ struct Settings {
     /// SECURITY.md §10: clipboard sync is opt-in.
     #[serde(default)]
     clipboard_sync: bool,
+    /// Folder the user chose for received files (Windows); None = the platform default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    downloads: Option<String>,
+}
+
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Preferred listening port (falls back to any free port).
@@ -266,6 +329,18 @@ impl Node {
             .unwrap_or_default();
         let trust = TrustStore::load(data_dir.join("trusted.json"))
             .map_err(|e| fail(format!("Couldn't load trusted devices: {e:#}")))?;
+        let history_path = data_dir.join("history.json");
+        let history: Vec<HistoryEntry> = std::fs::read(&history_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        // A chosen folder that is gone (unplugged drive) falls back to the default.
+        let downloads = settings
+            .downloads
+            .as_ref()
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| downloads_dir.into());
         // Two workers are plenty for a LAN app; one per core would only add idle threads.
         let runtime = Builder::new_multi_thread()
             .worker_threads(2)
@@ -276,12 +351,14 @@ impl Node {
         let inner = Arc::new(Inner {
             identity: Arc::new(identity),
             trust: Arc::new(trust),
-            downloads: downloads_dir.into(),
+            downloads: Mutex::new(downloads),
             listener,
             rt: runtime.handle().clone(),
             peers: Mutex::default(),
             pending: Mutex::default(),
             sends: Mutex::default(),
+            paused: Mutex::default(),
+            silent: Mutex::default(),
             inbox: Mutex::default(),
             error: Mutex::default(),
             pairing: Arc::default(),
@@ -289,8 +366,12 @@ impl Node {
             discover: AtomicBool::new(true),
             discovery: Mutex::default(),
             clipboard_sync: AtomicBool::new(settings.clipboard_sync),
+            settings: Mutex::new(settings),
             settings_path,
             last_clip: Mutex::default(),
+            live: Mutex::default(),
+            history_path,
+            history: Mutex::new(history),
         });
         let node = inner.clone();
         runtime.spawn(async move {
@@ -312,7 +393,7 @@ impl Node {
             name: i.identity.name.clone(),
             id: i.identity.id.to_string(),
             fingerprint: i.identity.fingerprint(),
-            downloads: i.downloads.display().to_string(),
+            downloads: i.downloads.lock().unwrap().display().to_string(),
             version: VERSION.into(),
             error: i.error.lock().unwrap().clone(),
         }
@@ -331,10 +412,88 @@ impl Node {
             .map(|(fingerprint, d)| TrustedInfo {
                 fingerprint,
                 name: d.name,
+                auto_accept: d.auto_accept,
             })
             .collect();
         list.sort_by_key(|t| t.name.to_lowercase());
         list
+    }
+
+    /// Changes the name this device shows for a paired device (lists, requests, history).
+    pub fn rename_device(&self, fingerprint: String, name: String) -> Result<(), NodeError> {
+        let name = name.trim().to_string();
+        if name.is_empty() || name.chars().count() > 64 || name.chars().any(char::is_control) {
+            return Err(fail("Enter a device name of up to 64 characters."));
+        }
+        self.inner
+            .trust
+            .update(&fingerprint, |d| {
+                let changed = d.name != name;
+                d.name = name;
+                changed
+            })
+            .map_err(|e| fail(format!("Couldn't save the name: {e}")))?;
+        self.inner.recheck_all();
+        Ok(())
+    }
+
+    /// Accept every transfer from this paired device without asking (off by default).
+    pub fn set_auto_accept(&self, fingerprint: String, enabled: bool) -> Result<(), NodeError> {
+        self.inner
+            .trust
+            .update(&fingerprint, |d| {
+                let changed = d.auto_accept != enabled;
+                d.auto_accept = enabled;
+                changed
+            })
+            .map_err(|e| fail(format!("Couldn't save the setting: {e}")))
+    }
+
+    /// Finished and paused transfers, newest first (kept across restarts).
+    pub fn history(&self) -> Vec<HistoryEntry> {
+        self.inner.history.lock().unwrap().clone()
+    }
+
+    pub fn clear_history(&self) -> Result<(), NodeError> {
+        let mut history = self.inner.history.lock().unwrap();
+        history.clear();
+        crate::disk::write_atomic(&self.inner.history_path, b"[]")
+            .map_err(|e| fail(format!("Couldn't clear the history: {e}")))
+    }
+
+    /// Saves received files in `path` from now on (an existing folder). Transfers already
+    /// running finish where they started.
+    pub fn set_downloads(&self, path: String) -> Result<(), NodeError> {
+        let dir = PathBuf::from(&path);
+        if !dir.is_dir() {
+            return Err(fail("Choose a folder that exists."));
+        }
+        self.inner
+            .save_settings(|s| s.downloads = Some(path))
+            .map_err(|e| fail(format!("Couldn't save the setting: {e}")))?;
+        if let Some(inbox) = self.inner.inbox.lock().unwrap().as_ref() {
+            inbox.set_dest(dir.clone());
+        }
+        *self.inner.downloads.lock().unwrap() = dir;
+        Ok(())
+    }
+
+    /// Sends a link or text to a nearby paired device. Blocks for up to a few seconds;
+    /// call it off the UI thread.
+    pub fn send_text(&self, device: String, text: String) -> Result<(), NodeError> {
+        let text = text.trim().to_string();
+        if text.is_empty() || text.len() > server::MAX_CLIPBOARD {
+            return Err(fail("Enter a link or text of up to 64 KB."));
+        }
+        let addr = self.inner.peer_addr(&device)?;
+        let node = self.inner.clone();
+        self.inner
+            .rt
+            .block_on(async move {
+                let msg = Message::Text { text };
+                server::send_one(addr, &node.identity, node.trust.clone(), &msg).await
+            })
+            .map_err(|e| fail(friendly(&e)))
     }
 
     pub fn pair(&self, fingerprint: String, name: String) -> Result<(), NodeError> {
@@ -380,17 +539,69 @@ impl Node {
             (true, true) => state(id, TransferState::Transferring, None),
             (true, false) => state(id, TransferState::Cancelled, Some("Declined")),
         };
-        self.inner.listener.transfer_changed(update);
+        self.inner.report(update);
     }
 
     /// Starts sending files/folders to a nearby paired device. Returns the transfer id.
     pub fn send(&self, device: String, paths: Vec<String>) -> Result<String, NodeError> {
-        let count = paths.len() as u64;
-        let sources = paths
-            .into_iter()
-            .map(|p| transfer::Source::Path(p.into()))
-            .collect();
-        self.start_send(device, sources, count)
+        let sources = paths.into_iter().map(|p| Source::Path(p.into())).collect();
+        self.start_send(device, sources)
+    }
+
+    /// Sends a PNG image just copied on this device to every paired device listed, if
+    /// clipboard sync is on. The file is opened at once, so the caller may delete it after.
+    pub fn clipboard_image(&self, path: String) -> Result<(), NodeError> {
+        let file = std::fs::File::open(&path).map_err(|e| fail(e.to_string()))?;
+        self.inner.share_clipboard_image(file)
+    }
+
+    /// Like `clipboard_image`, for an open PNG file (Android). Takes ownership of `fd`.
+    pub fn clipboard_image_fd(&self, fd: i32) -> Result<(), NodeError> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::FromRawFd;
+            // SAFETY: the caller hands over an open descriptor it no longer uses (detachFd).
+            let file = unsafe { std::fs::File::from_raw_fd(fd) };
+            self.inner.share_clipboard_image(file)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = fd;
+            Err(fail("Sending open files is only supported on Android."))
+        }
+    }
+
+    /// Stops an outgoing transfer but lets the receiver keep what arrived; `resume` continues.
+    pub fn pause(&self, id: String) {
+        let Ok(id) = Uuid::parse_str(&id) else { return };
+        if let Some((stop, pause)) = self.inner.sends.lock().unwrap().get(&id) {
+            pause.store(true, Ordering::SeqCst);
+            let _ = stop.send(true);
+        }
+    }
+
+    /// Sends a paused transfer again; the receiver continues where it stopped, without asking.
+    pub fn resume(&self, id: String) -> Result<(), NodeError> {
+        let uid = Uuid::parse_str(&id).map_err(|_| fail("Unknown transfer."))?;
+        let paused = self
+            .inner
+            .paused
+            .lock()
+            .unwrap()
+            .remove(&uid)
+            .ok_or_else(|| fail("This transfer can't be resumed. Send the files again."))?;
+        let addr = match self.inner.peer_addr(&paused.device.to_string()) {
+            Ok(addr) => addr,
+            Err(e) => {
+                self.inner.paused.lock().unwrap().insert(uid, paused);
+                return Err(e);
+            }
+        };
+        self.inner
+            .report(state(uid, TransferState::WaitingForAccept, None));
+        self.inner
+            .spawn_send(uid, paused.device, addr, paused.sources, false);
+        Ok(())
     }
 
     /// Like `send`, for files the app already opened (Android content URIs): no copy is made.
@@ -400,16 +611,15 @@ impl Node {
         #[cfg(unix)]
         {
             use std::os::fd::FromRawFd;
-            let count = files.len() as u64;
             let sources = files
                 .into_iter()
-                .map(|f| transfer::Source::Open {
+                .map(|f| Source::Open {
                     name: f.name,
                     // SAFETY: the caller hands over an open descriptor it no longer uses (detachFd).
                     file: unsafe { std::fs::File::from_raw_fd(f.fd) },
                 })
                 .collect();
-            self.start_send(device, sources, count)
+            self.start_send(device, sources)
         }
         #[cfg(not(unix))]
         {
@@ -428,48 +638,112 @@ pub struct FdFile {
 }
 
 impl Node {
-    fn start_send(
-        &self,
-        device: String,
-        sources: Vec<transfer::Source>,
-        items: u64,
-    ) -> Result<String, NodeError> {
+    fn start_send(&self, device: String, sources: Vec<Source>) -> Result<String, NodeError> {
         if sources.is_empty() {
             return Err(fail("Choose at least one file or folder."));
         }
+        let addr = self.inner.peer_addr(&device)?;
         let device = Uuid::parse_str(&device).map_err(|_| fail("Unknown device."))?;
-        let (name, addr) = {
-            let peers = self.inner.peers.lock().unwrap();
-            let peer = peers
-                .get(&device)
-                .ok_or_else(|| fail("That device is no longer nearby."))?;
-            (peer.info.name.clone(), peer.addr)
-        };
+        let peer = self
+            .inner
+            .peers
+            .lock()
+            .unwrap()
+            .get(&device)
+            .map(|p| p.info.name.clone());
 
         let id = Uuid::new_v4();
-        self.inner.listener.transfer_changed(TransferUpdate {
+        self.inner.report(TransferUpdate {
             id: id.to_string(),
             outgoing: Some(true),
-            peer: Some(name),
-            items: Some(items),
+            peer,
+            name: Some(sources[0].name()),
+            items: Some(sources.len() as u64),
             done: Some(0),
             state: Some(TransferState::WaitingForAccept),
             ..Default::default()
         });
+        self.inner.spawn_send(id, device, addr, sources, false);
+        Ok(id.to_string())
+    }
+}
 
-        let node = self.inner.clone();
-        let (cancel_tx, cancel) = watch::channel(false);
-        self.inner.sends.lock().unwrap().insert(id, cancel_tx);
-        self.inner.rt.spawn(async move {
-            let tick = node.listener.clone();
-            let (identity, trust) = (node.identity.clone(), node.trust.clone());
-            let result = transfer::send(addr, identity, trust, sources, cancel, {
-                move |done, total| tick.transfer_changed(progress(id, done, total))
+impl Inner {
+    /// Address of a listed device, by id.
+    fn peer_addr(&self, device: &str) -> Result<SocketAddr, NodeError> {
+        let device = Uuid::parse_str(device).map_err(|_| fail("Unknown device."))?;
+        self.peers
+            .lock()
+            .unwrap()
+            .get(&device)
+            .map(|p| p.addr)
+            .ok_or_else(|| fail("That device is no longer nearby."))
+    }
+
+    /// Runs one send in the background and reports it as transfer `id`. A `clipboard` send
+    /// (an image for clipboard sync) is never reported and can't be paused.
+    fn spawn_send(
+        self: &Arc<Self>,
+        id: Uuid,
+        device: Uuid,
+        addr: SocketAddr,
+        sources: Vec<Source>,
+        clipboard: bool,
+    ) {
+        // Kept to send again if the user pauses; dropped (closing any duplicates) otherwise.
+        let again: Option<Vec<Source>> = (!clipboard)
+            .then(|| {
+                sources
+                    .iter()
+                    .map(Source::try_clone)
+                    .collect::<Result<_, _>>()
+                    .ok()
             })
+            .flatten();
+        let (stop, cancel) = watch::channel(false);
+        let options = SendOptions {
+            clipboard,
+            ..Default::default()
+        };
+        if !clipboard {
+            let entry = (stop, options.pause.clone());
+            self.sends.lock().unwrap().insert(id, entry);
+        }
+        let node = self.clone();
+        self.rt.spawn(async move {
+            let tick = node.clone();
+            let (identity, trust) = (node.identity.clone(), node.trust.clone());
+            let result = transfer::send_with(
+                addr,
+                identity,
+                trust,
+                sources,
+                cancel,
+                move |done, total| {
+                    if !clipboard {
+                        tick.report(progress(id, done, total))
+                    }
+                },
+                &options,
+            )
             .await;
             node.sends.lock().unwrap().remove(&id);
+            if clipboard {
+                if let Err(e) = result {
+                    tracing::debug!(%addr, "clipboard image not delivered: {e:#}");
+                }
+                return;
+            }
             let update = match result {
                 Ok(Outcome::Completed) => state(id, TransferState::Completed, None),
+                Ok(Outcome::Paused) => match again {
+                    Some(sources) => {
+                        let paused = PausedSend { device, sources };
+                        node.paused.lock().unwrap().insert(id, paused);
+                        state(id, TransferState::Paused, Some("Paused"))
+                    }
+                    None => state(id, TransferState::Cancelled, Some("You cancelled")),
+                },
                 Ok(Outcome::Declined { reason: None }) => {
                     state(id, TransferState::Cancelled, Some("Declined"))
                 }
@@ -479,9 +753,118 @@ impl Node {
                 Ok(Outcome::Cancelled { by_peer }) => cancelled_update(id, by_peer),
                 Err(e) => state(id, TransferState::Failed, Some(&friendly(&e))),
             };
-            node.listener.transfer_changed(update);
+            node.report(update);
         });
-        Ok(id.to_string())
+    }
+
+    fn share_clipboard_image(self: &Arc<Self>, file: std::fs::File) -> Result<(), NodeError> {
+        if !self.clipboard_sync.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let size = file.metadata().map_err(|e| fail(e.to_string()))?.len();
+        if size == 0 || size > MAX_CLIPBOARD_IMAGE {
+            return Ok(()); // too big to sync: skipped like long text
+        }
+        let targets: Vec<(Uuid, SocketAddr)> = {
+            let peers = self.peers.lock().unwrap();
+            peers
+                .iter()
+                .filter(|(_, p)| p.info.trusted == Some(true))
+                .map(|(id, p)| (*id, p.addr))
+                .collect()
+        };
+        for (device, addr) in targets {
+            let file = file.try_clone().map_err(|e| fail(e.to_string()))?;
+            let source = Source::Open {
+                name: "Clipboard.png".into(),
+                file,
+            };
+            self.spawn_send(Uuid::new_v4(), device, addr, vec![source], true);
+        }
+        Ok(())
+    }
+
+    fn save_settings(&self, change: impl FnOnce(&mut Settings)) -> std::io::Result<()> {
+        let mut settings = self.settings.lock().unwrap();
+        change(&mut settings);
+        let bytes = serde_json::to_vec_pretty(&*settings)?;
+        crate::disk::write_atomic(&self.settings_path, &bytes)
+    }
+
+    /// Tells the UI, and records the transfer in history once it ends (or pauses).
+    fn report(&self, update: TransferUpdate) {
+        self.record(&update);
+        self.listener.transfer_changed(update);
+    }
+
+    fn record(&self, u: &TransferUpdate) {
+        let mut live = self.live.lock().unwrap();
+        let entry = live.entry(u.id.clone()).or_insert_with(|| {
+            // A resumed transfer continues its paused history entry.
+            let history = self.history.lock().unwrap();
+            history
+                .iter()
+                .find(|h| h.id == u.id)
+                .cloned()
+                .unwrap_or(HistoryEntry {
+                    id: u.id.clone(),
+                    outgoing: false,
+                    peer: String::new(),
+                    name: String::new(),
+                    items: 0,
+                    total: 0,
+                    state: TransferState::WaitingForAccept,
+                    reason: None,
+                    saved: Vec::new(),
+                    finished: 0,
+                })
+        });
+        if let Some(v) = u.outgoing {
+            entry.outgoing = v;
+        }
+        if let Some(v) = &u.peer {
+            entry.peer.clone_from(v);
+        }
+        if let Some(v) = &u.name {
+            entry.name.clone_from(v);
+        }
+        if let Some(v) = u.items {
+            entry.items = v;
+        }
+        if let Some(v) = u.total {
+            entry.total = v;
+        }
+        if let Some(v) = &u.saved {
+            entry.saved.clone_from(v);
+        }
+        let Some(state) = u.state else { return };
+        entry.state = state;
+        entry.reason.clone_from(&u.reason);
+        let ended = !matches!(
+            state,
+            TransferState::WaitingForAccept
+                | TransferState::Transferring
+                | TransferState::Verifying
+        );
+        if !ended {
+            return;
+        }
+        let mut entry = live.remove(&u.id).expect("inserted above");
+        drop(live);
+        if entry.peer.is_empty() {
+            return; // an update for a transfer this node never saw start (an expired request)
+        }
+        entry.finished = now();
+        let mut history = self.history.lock().unwrap();
+        history.retain(|h| h.id != entry.id);
+        history.insert(0, entry);
+        history.truncate(HISTORY_MAX);
+        let saved = serde_json::to_vec(&*history)
+            .map_err(std::io::Error::from)
+            .and_then(|b| crate::disk::write_atomic(&self.history_path, &b));
+        if let Err(e) = saved {
+            tracing::warn!("couldn't save transfer history: {e}");
+        }
     }
 }
 
@@ -491,8 +874,13 @@ impl Node {
     /// The other device is told, shows it as cancelled, and discards anything partly received.
     pub fn cancel(&self, id: String) {
         let Ok(id) = Uuid::parse_str(&id) else { return };
-        if let Some(tx) = self.inner.sends.lock().unwrap().get(&id) {
+        if let Some((tx, _)) = self.inner.sends.lock().unwrap().get(&id) {
             let _ = tx.send(true);
+            return;
+        }
+        // A paused send: forget its files. The receiver drops what it kept after a week.
+        if self.inner.paused.lock().unwrap().remove(&id).is_some() {
+            self.inner.report(cancelled_update(id, false));
             return;
         }
         let incoming = self.inner.inbox.lock().unwrap().clone();
@@ -507,11 +895,8 @@ impl Node {
     }
 
     pub fn set_clipboard_sync(&self, enabled: bool) -> Result<(), NodeError> {
-        let settings = Settings {
-            clipboard_sync: enabled,
-        };
-        let bytes = serde_json::to_vec_pretty(&settings).map_err(|e| fail(e.to_string()))?;
-        crate::disk::write_atomic(&self.inner.settings_path, &bytes)
+        self.inner
+            .save_settings(|s| s.clipboard_sync = enabled)
             .map_err(|e| fail(format!("Couldn't save the setting: {e}")))?;
         self.inner.clipboard_sync.store(enabled, Ordering::SeqCst);
         if !enabled {
@@ -537,12 +922,12 @@ impl Node {
                 .map(|p| p.addr)
                 .collect()
         };
-        let text = Arc::new(text);
+        let msg = Arc::new(Message::Clipboard { text });
         for addr in targets {
-            let (node, text) = (self.inner.clone(), text.clone());
+            let (node, msg) = (self.inner.clone(), msg.clone());
             self.inner.rt.spawn(async move {
                 if let Err(e) =
-                    server::send_clipboard(addr, &node.identity, node.trust.clone(), &text).await
+                    server::send_one(addr, &node.identity, node.trust.clone(), &msg).await
                 {
                     tracing::debug!(%addr, "clipboard not delivered: {e:#}"); // the error, never the text
                 }
@@ -565,7 +950,7 @@ impl Node {
     /// row by row, true = dark) for the other device to scan.
     pub fn start_pairing(&self) -> Result<PairingOffer, NodeError> {
         let port = (*self.inner.port.lock().unwrap())
-            .ok_or_else(|| fail("RustDrop isn't ready to pair yet. Try again in a moment."))?;
+            .ok_or_else(|| fail("Ferrydrop isn't ready to pair yet. Try again in a moment."))?;
         let addrs = local_addrs(port);
         if addrs.is_empty() {
             return Err(fail("Connect to a Wi-Fi or wired network to pair."));
@@ -598,7 +983,7 @@ impl Node {
     /// trusting each other. Blocks for up to a few seconds per address; call it off the UI thread
     /// and never from inside an async runtime.
     pub fn pair_with_link(&self, link: String) -> Result<String, NodeError> {
-        let link = parse_link(&link).ok_or_else(|| fail("That isn't a RustDrop pairing code."))?;
+        let link = parse_link(&link).ok_or_else(|| fail("That isn't a Ferrydrop pairing code."))?;
         if link.fp == self.inner.identity.fingerprint() {
             return Err(fail("That's this device's own pairing code."));
         }
@@ -745,7 +1130,8 @@ impl Inner {
             }
             let node = self.clone();
             self.rt.spawn(async move {
-                let Ok((info, _)) = server::ping(addr, &node.identity, node.trust.clone()).await
+                let Ok((info, _, fp)) =
+                    server::ping(addr, &node.identity, node.trust.clone()).await
                 else {
                     return;
                 };
@@ -757,7 +1143,7 @@ impl Inner {
                     }
                     let info = PeerInfo {
                         id: id.to_string(),
-                        name: info.name,
+                        name: node.trust.get(&fp).map_or(info.name, |d| d.name),
                         platform: info.platform,
                         trusted: Some(true),
                     };
@@ -835,11 +1221,18 @@ impl Inner {
         self.emit_peers();
         let node = self.clone();
         self.rt.spawn(async move {
-            let ok = server::ping(addr, &node.identity, node.trust.clone())
-                .await
-                .is_ok();
+            let pong = server::ping(addr, &node.identity, node.trust.clone()).await;
+            // A paired device shows the name the user gave it, not the one it announces.
+            let label = pong
+                .as_ref()
+                .ok()
+                .and_then(|(_, _, fp)| node.trust.get(fp))
+                .map(|d| d.name);
             if let Some(p) = node.peers.lock().unwrap().get_mut(&id) {
-                p.info.trusted = Some(ok);
+                p.info.trusted = Some(pong.is_ok());
+                if let Some(label) = label {
+                    p.info.name = label;
+                }
             }
             node.emit_peers();
         });
@@ -854,8 +1247,26 @@ impl Inner {
 
     fn forward(self: &Arc<Self>, event: Event) {
         let update = match event {
+            Event::Incoming(req) if req.clipboard => {
+                // Clipboard images are never shown as transfers; only taken while sync is on.
+                let ok = self.clipboard_sync.load(Ordering::SeqCst)
+                    && req.total() <= MAX_CLIPBOARD_IMAGE
+                    && req.files[0].path.to_ascii_lowercase().ends_with(".png");
+                if ok {
+                    let mut silent = self.silent.lock().unwrap();
+                    silent.insert(req.transfer_id, req.trusted_name.clone());
+                }
+                let _ = req.decision.send(ok);
+                return;
+            }
             Event::Incoming(req) => {
                 let id = req.transfer_id;
+                // The user accepted this device for good, or these files before the sender paused.
+                let auto = req.resumed
+                    || self
+                        .trust
+                        .get(&req.fingerprint)
+                        .is_some_and(|d| d.auto_accept);
                 let view = IncomingRequest {
                     id: id.to_string(),
                     sender: req.trusted_name.clone(),
@@ -872,16 +1283,27 @@ impl Inner {
                         })
                         .collect(),
                 };
-                self.listener.transfer_changed(TransferUpdate {
+                self.report(TransferUpdate {
                     id: view.id.clone(),
                     outgoing: Some(false),
                     peer: Some(view.sender.clone()),
+                    name: view.files.first().map(|f| f.path.clone()),
                     items: Some(view.count),
                     total: Some(view.total),
                     done: Some(0),
                     state: Some(TransferState::WaitingForAccept),
                     ..Default::default()
                 });
+                if auto {
+                    let accepted = req.decision.send(true).is_ok();
+                    let update = if accepted {
+                        state(id, TransferState::Transferring, None)
+                    } else {
+                        state(id, TransferState::Failed, Some("The request expired."))
+                    };
+                    self.report(update);
+                    return;
+                }
                 let mut pending = self.pending.lock().unwrap();
                 // Requests that expired unanswered: their receiver side is gone.
                 pending.retain(|_, tx| !tx.is_closed());
@@ -890,15 +1312,36 @@ impl Inner {
                 self.listener.incoming(view);
                 return;
             }
+            Event::Progress { transfer_id, .. }
+                if self.silent.lock().unwrap().contains_key(&transfer_id) =>
+            {
+                return;
+            }
             Event::Progress {
                 transfer_id,
                 done,
                 total,
             } => progress(transfer_id, done, total),
-            Event::Completed { transfer_id, saved } => TransferUpdate {
-                saved: Some(saved.iter().map(|p| p.display().to_string()).collect()),
-                ..state(transfer_id, TransferState::Completed, None)
-            },
+            Event::Completed { transfer_id, saved } => {
+                if let Some(from) = self.silent.lock().unwrap().remove(&transfer_id) {
+                    if let Some(path) = saved.first() {
+                        let path = path.display().to_string();
+                        self.listener.clipboard_image_received(path, from);
+                    }
+                    return;
+                }
+                TransferUpdate {
+                    saved: Some(saved.iter().map(|p| p.display().to_string()).collect()),
+                    ..state(transfer_id, TransferState::Completed, None)
+                }
+            }
+            Event::Failed { transfer_id, .. }
+            | Event::Cancelled { transfer_id, .. }
+            | Event::Paused { transfer_id }
+                if self.silent.lock().unwrap().remove(&transfer_id).is_some() =>
+            {
+                return;
+            }
             Event::Failed {
                 transfer_id,
                 reason,
@@ -909,6 +1352,15 @@ impl Inner {
             } => {
                 self.pending.lock().unwrap().remove(&transfer_id);
                 cancelled_update(transfer_id, by_peer)
+            }
+            Event::Paused { transfer_id } => state(
+                transfer_id,
+                TransferState::Paused,
+                Some("Paused by the other device"),
+            ),
+            Event::Text { text, from } => {
+                self.listener.text_received(text, from);
+                return;
             }
             Event::Clipboard { text, from } => {
                 if self.clipboard_sync.load(Ordering::SeqCst) && self.remember_clip(&text) {
@@ -923,7 +1375,7 @@ impl Inner {
                 return;
             }
         };
-        self.listener.transfer_changed(update);
+        self.report(update);
     }
 }
 
@@ -938,7 +1390,7 @@ async fn run(node: Arc<Inner>) -> anyhow::Result<()> {
     node.identity.listen_port.store(port, Ordering::Relaxed);
     *node.port.lock().unwrap() = Some(port);
     let (tx, mut events) = mpsc::channel(32);
-    let inbox = Arc::new(Inbox::new(node.downloads.clone(), tx));
+    let inbox = Arc::new(Inbox::new(node.downloads.lock().unwrap().clone(), tx));
     *node.inbox.lock().unwrap() = Some(inbox.clone());
     tokio::spawn(server::listen(
         listener,
@@ -1018,16 +1470,20 @@ mod tests {
     use super::*;
     use crate::server::tests::temp_dir;
 
+    /// Updates, pairings, clipboard texts, other events ("text:", "image:", "incoming:").
     #[derive(Default)]
     struct Recorder(
         Mutex<Vec<TransferUpdate>>,
+        Mutex<Vec<String>>,
         Mutex<Vec<String>>,
         Mutex<Vec<String>>,
     );
 
     impl Listener for Recorder {
         fn peers_changed(&self, _: Vec<PeerInfo>) {}
-        fn incoming(&self, _: IncomingRequest) {}
+        fn incoming(&self, r: IncomingRequest) {
+            self.3.lock().unwrap().push(format!("incoming:{}", r.id));
+        }
         fn transfer_changed(&self, update: TransferUpdate) {
             self.0.lock().unwrap().push(update);
         }
@@ -1036,6 +1492,12 @@ mod tests {
         }
         fn clipboard_received(&self, text: String, _from: String) {
             self.2.lock().unwrap().push(text);
+        }
+        fn clipboard_image_received(&self, path: String, _from: String) {
+            self.3.lock().unwrap().push(format!("image:{path}"));
+        }
+        fn text_received(&self, text: String, from: String) {
+            self.3.lock().unwrap().push(format!("text:{from}:{text}"));
         }
         fn failed(&self, _: String) {}
     }
@@ -1211,5 +1673,122 @@ mod tests {
         let updates = recorder.0.lock().unwrap();
         assert_eq!(updates[0].id, id);
         assert_eq!(updates[0].state, Some(TransferState::Failed));
+        // A transfer this node never saw start is not history.
+        assert!(node.history().is_empty());
+    }
+
+    fn peer_id(n: &Node) -> String {
+        n.peers()[0].id.clone()
+    }
+
+    #[test]
+    fn auto_accept_history_text_and_rename() {
+        let (a, b, ra, rb) = paired_nodes();
+        let src = temp_dir("auto");
+        std::fs::create_dir_all(&src).unwrap();
+        let file = src.join("report.txt");
+        std::fs::write(&file, b"quarterly numbers").unwrap();
+
+        // b accepts everything from a without asking.
+        b.set_auto_accept(a.me().fingerprint, true).unwrap();
+        assert!(b.trusted()[0].auto_accept);
+        let id = a
+            .send(peer_id(&a), vec![file.display().to_string()])
+            .unwrap();
+        let done = |r: &Recorder| {
+            r.0.lock()
+                .unwrap()
+                .iter()
+                .any(|u| u.state == Some(TransferState::Completed))
+        };
+        assert!(
+            wait_for(|| done(&ra) && done(&rb)),
+            "{:?}",
+            rb.0.lock().unwrap()
+        );
+        assert!(rb.3.lock().unwrap().is_empty(), "b was asked");
+
+        // Both sides keep it in history, across a restart of the list.
+        let h = a.history();
+        assert_eq!(
+            (h[0].id.as_str(), h[0].name.as_str()),
+            (id.as_str(), "report.txt")
+        );
+        assert_eq!(
+            (h[0].state, h[0].outgoing, h[0].total),
+            (TransferState::Completed, true, 17)
+        );
+        let h = b.history();
+        assert_eq!((h[0].peer.as_str(), h[0].saved.len()), ("Phone", 1));
+        b.clear_history().unwrap();
+        assert!(b.history().is_empty());
+
+        // A link sent on purpose arrives as text, whatever clipboard sync says.
+        a.send_text(peer_id(&a), " https://example.com/x ".into())
+            .unwrap();
+        assert!(wait_for(|| rb
+            .3
+            .lock()
+            .unwrap()
+            .contains(&"text:Phone:https://example.com/x".to_string())));
+        assert!(a.send_text(peer_id(&a), "  ".into()).is_err());
+
+        // Renaming a paired device changes what this side lists.
+        b.rename_device(a.me().fingerprint, "Work phone".into())
+            .unwrap();
+        assert!(b.rename_device(a.me().fingerprint, "".into()).is_err());
+        b.refresh();
+        assert!(wait_for(|| b.peers()[0].name == "Work phone"));
+        assert_eq!(b.trusted()[0].name, "Work phone");
+        assert!(b.trusted()[0].auto_accept, "rename keeps auto-accept");
+    }
+
+    #[test]
+    fn clipboard_image_only_moves_when_sync_is_on_and_is_never_a_transfer() {
+        let (a, b, ra, rb) = paired_nodes();
+        let src = temp_dir("clip");
+        std::fs::create_dir_all(&src).unwrap();
+        let png = src.join("shot.png");
+        std::fs::write(&png, b"\x89PNG fake image bytes").unwrap();
+
+        a.clipboard_image(png.display().to_string()).unwrap(); // sync off: nothing
+        b.set_clipboard_sync(true).unwrap();
+        a.clipboard_image(png.display().to_string()).unwrap(); // only b on: still nothing
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(rb.3.lock().unwrap().is_empty());
+
+        a.set_clipboard_sync(true).unwrap();
+        a.clipboard_image(png.display().to_string()).unwrap();
+        assert!(wait_for(|| !rb.3.lock().unwrap().is_empty()));
+        let got = rb.3.lock().unwrap()[0].clone();
+        let path = got.strip_prefix("image:").expect("an image event");
+        assert_eq!(std::fs::read(path).unwrap(), b"\x89PNG fake image bytes");
+        assert!(ra.0.lock().unwrap().is_empty() && rb.0.lock().unwrap().is_empty());
+        assert!(a.history().is_empty() && b.history().is_empty());
+    }
+
+    #[test]
+    fn download_folder_can_be_changed_and_persists() {
+        let recorder = Arc::new(Recorder::default());
+        let dir = temp_dir("dlset");
+        let data = dir.join("data").display().to_string();
+        let other = dir.join("elsewhere");
+        let node = Node::new(
+            data.clone(),
+            dir.join("dl").display().to_string(),
+            None,
+            recorder.clone(),
+        )
+        .unwrap();
+        assert!(
+            node.set_downloads(other.display().to_string()).is_err(),
+            "must exist"
+        );
+        std::fs::create_dir_all(&other).unwrap();
+        node.set_downloads(other.display().to_string()).unwrap();
+        assert_eq!(node.me().downloads, other.display().to_string());
+        drop(node);
+        let again = Node::new(data, dir.join("dl").display().to_string(), None, recorder).unwrap();
+        assert_eq!(again.me().downloads, other.display().to_string());
     }
 }

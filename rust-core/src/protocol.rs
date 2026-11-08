@@ -51,9 +51,12 @@ pub struct FileMeta {
 pub enum Message {
     Hello(DeviceInfo),
     HelloAck(DeviceInfo),
-    /// Either side stops a transfer (before or after ACCEPT).
+    /// Either side stops a transfer (before or after ACCEPT). `pause` (sender only): keep what
+    /// arrived, the same files will be sent again to continue.
     Cancel {
         transfer_id: Uuid,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pause: bool,
     },
     Ping {
         nonce: u64,
@@ -64,6 +67,9 @@ pub enum Message {
     SendRequest {
         transfer_id: Uuid,
         files: Vec<FileMeta>,
+        /// One image copied on the sender, for the receiver's clipboard (clipboard sync, opt-in).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        clipboard: bool,
     },
     Accept {
         transfer_id: Uuid,
@@ -95,6 +101,10 @@ pub enum Message {
     },
     /// Clipboard sync: plain text copied on the sender (only between paired devices, opt-in on both).
     Clipboard {
+        text: String,
+    },
+    /// A link or text the user sent on purpose (not clipboard sync). Shown, never opened by itself.
+    Text {
         text: String,
     },
     /// QR pairing: the one-time code read from the QR. The only message an untrusted peer may send.

@@ -9,6 +9,7 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.Settings
 import app.rustdrop.core.FdFile
+import app.rustdrop.core.HistoryEntry
 import app.rustdrop.core.IncomingRequest
 import app.rustdrop.core.Listener
 import app.rustdrop.core.Me
@@ -37,6 +38,8 @@ data class Transfer(
     val id: String,
     val outgoing: Boolean = false,
     val peer: String = "",
+    /** First file or folder name. */
+    val name: String = "",
     val items: Long = 0,
     val total: Long = 0,
     val done: Long = 0,
@@ -49,6 +52,27 @@ data class Transfer(
 )
 
 val ACTIVE = setOf(TransferState.WAITING_FOR_ACCEPT, TransferState.TRANSFERRING, TransferState.VERIFYING)
+
+/** A link or text another device sent on purpose. */
+data class ReceivedText(val text: String, val from: String, val at: Long = System.currentTimeMillis())
+
+private fun HistoryEntry.toTransfer(): Transfer {
+    // The files of a paused send are only held while the app runs.
+    val paused = state == TransferState.PAUSED
+    return Transfer(
+        id = id,
+        outgoing = outgoing,
+        peer = peer,
+        name = name,
+        items = items.toLong(),
+        total = total.toLong(),
+        done = if (state == TransferState.COMPLETED) total.toLong() else 0,
+        state = if (paused) TransferState.CANCELLED else state,
+        reason = if (paused) "Paused, then Ferrydrop closed. Send the files again to continue." else reason,
+        savedCount = saved.size,
+        startedAt = finished.toLong() * 1000,
+    )
+}
 
 private const val REQUEST_TIMEOUT_MS = 60_000L // matches the core's DECISION_TIMEOUT
 private const val BACKGROUND_PAUSE_MS = 30_000L
@@ -79,6 +103,10 @@ object Core {
     val clipboardSync = MutableStateFlow(false)
     val clipboardFrom = MutableStateFlow<String?>(null)
 
+    /** A link or text waiting for a device (from the share sheet or typed), and texts received. */
+    val stagedText = MutableStateFlow<String?>(null)
+    val texts = MutableStateFlow<List<ReceivedText>>(emptyList())
+
     private val received get() = File(app.filesDir, "received")
     private var multicast: WifiManager.MulticastLock? = null
     private val main = Handler(Looper.getMainLooper())
@@ -102,6 +130,7 @@ object Core {
         me.value = node.me()
         trusted.value = node.trusted()
         clipboardSync.value = node.clipboardSync()
+        transfers.value = node.history().map { it.toTransfer() }
         watchForegroundService()
     }
 
@@ -178,13 +207,99 @@ object Core {
         }
     }
 
+    /** Sends the same files to several devices; each gets its own duplicates of the descriptors. */
+    fun sendAll(devices: List<String>, items: List<Outgoing>) {
+        val failed = devices.mapNotNull { device ->
+            runCatching { node.sendFds(device, items.map { FdFile(it.path, it.pfd.dup().detachFd()) }) }
+                .exceptionOrNull()?.let { it.message ?: "Couldn't send." }
+        }
+        if (staged.value === items) clearStaged() else Files.close(items)
+        notice.value = failed.distinct().joinToString(" ").ifEmpty { null }
+    }
+
     /** Holds picked files until a device is chosen, closing any that were staged before. */
     fun stage(items: List<Outgoing>) {
         Files.close(staged.value)
         staged.value = items
+        if (items.isNotEmpty()) stagedText.value = null
     }
 
-    fun clearStaged() = stage(emptyList())
+    fun clearStaged() {
+        stage(emptyList())
+        stagedText.value = null
+    }
+
+    fun stageText(text: String) {
+        stage(emptyList())
+        stagedText.value = text.trim().takeIf { it.isNotEmpty() }
+    }
+
+    /** Sends a link or text to each device; blocks on the network, so it runs on the IO dispatcher. */
+    suspend fun sendText(devices: List<String>, text: String) = withContext(Dispatchers.IO) {
+        val failed = devices.mapNotNull { runCatching { node.sendText(it, text) }.exceptionOrNull()?.message }
+        stagedText.value = null
+        notice.value = failed.distinct().joinToString(" ").ifEmpty { null }
+    }
+
+    fun dismissText(t: ReceivedText) = texts.update { list -> list.filter { it !== t } }
+
+    fun pause(id: String) {
+        if (started) node.pause(id)
+    }
+
+    fun resume(id: String) {
+        runCatching { node.resume(id) }.onFailure { notice.value = it.message }
+    }
+
+    fun clearHistory() {
+        runCatching { node.clearHistory() }
+            .onSuccess { transfers.update { list -> list.filter { it.state in ACTIVE || it.state == TransferState.PAUSED } } }
+            .onFailure { notice.value = it.message }
+    }
+
+    /** Returns an error message, or null on success. */
+    fun rename(fingerprint: String, name: String): String? = runCatching { node.renameDevice(fingerprint, name) }
+        .also { trusted.value = node.trusted() }
+        .exceptionOrNull()?.message
+
+    fun setAutoAccept(fingerprint: String, on: Boolean) {
+        runCatching { node.setAutoAccept(fingerprint, on) }.onFailure { notice.value = it.message }
+        trusted.value = node.trusted()
+    }
+
+    /**
+     * An image was copied on this phone: send it as PNG to paired devices (clipboard sync).
+     * Other formats are converted, since PCs only take PNG. The copy is unlinked once opened.
+     */
+    suspend fun clipboardImage(uri: android.net.Uri) = withContext(Dispatchers.IO) {
+        if (!started || !clipboardSync.value) return@withContext
+        val file = File.createTempFile("clip", ".png", app.cacheDir)
+        try {
+            val resolver = app.contentResolver
+            val png = resolver.getType(uri) == "image/png"
+            resolver.openInputStream(uri)?.use { input ->
+                file.outputStream().use { out ->
+                    if (png) {
+                        input.copyTo(out)
+                    } else {
+                        android.graphics.BitmapFactory.decodeStream(input)
+                            ?.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out)
+                    }
+                }
+            } ?: return@withContext
+            if (file.length() == 0L) return@withContext
+            val pfd = android.os.ParcelFileDescriptor.open(file, android.os.ParcelFileDescriptor.MODE_READ_ONLY)
+            runCatching { node.clipboardImageFd(pfd.detachFd()) }
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            // Unreadable or not an image: clipboard sync skips it, like text over 64 KB.
+        } finally {
+            file.delete()
+        }
+    }
+
+    /** Authority of our FileProvider, which serves received clipboard images. */
+    val clipAuthority get() = "${app.packageName}.files"
 
     fun pair(fingerprint: String, name: String): String? = try {
         node.pair(fingerprint, name)
@@ -235,11 +350,12 @@ object Core {
         var t = old.copy(
             outgoing = u.outgoing ?: old.outgoing,
             peer = u.peer ?: old.peer,
+            name = u.name ?: old.name,
             items = u.items?.toLong() ?: old.items,
             total = u.total?.toLong() ?: old.total,
             done = u.done?.toLong() ?: old.done,
             state = u.state ?: old.state,
-            reason = u.reason ?: old.reason,
+            reason = if (u.state != null) u.reason else old.reason,
             savedCount = u.saved?.size ?: old.savedCount,
         )
         if (t.state == TransferState.TRANSFERRING && t.flowingAt == null) t = t.copy(flowingAt = now)
@@ -247,12 +363,38 @@ object Core {
     }
 
     private fun update(id: String, state: TransferState, reason: String?) =
-        TransferUpdate(id, null, null, null, null, null, state, reason, null)
+        TransferUpdate(id, null, null, null, null, null, null, state, reason, null)
 
     /** Receives core events on Rust threads; flows are thread-safe. */
     private object Events : Listener {
         override fun peersChanged(peers: List<PeerInfo>) {
             Core.peers.value = peers
+            Shortcuts.update(app, peers.filter { it.trusted == true })
+        }
+
+        override fun textReceived(text: String, from: String) {
+            texts.update { (listOf(ReceivedText(text, from)) + it).take(5) }
+            if (!visible) Notifications.text(app, text, from)
+        }
+
+        override fun clipboardImageReceived(path: String, from: String) {
+            // Served to other apps by our FileProvider; one file, replaced by the next image.
+            val src = File(path)
+            val dir = File(app.cacheDir, "clipboard").apply { mkdirs() }
+            val dest = File(dir, "clipboard.png")
+            val copied = runCatching { src.copyTo(dest, overwrite = true) }.isSuccess
+            src.delete()
+            if (!copied) return
+            val uri = androidx.core.content.FileProvider.getUriForFile(app, clipAuthority, dest)
+            main.post {
+                app.getSystemService(ClipboardManager::class.java)
+                    .setPrimaryClip(ClipData.newUri(app.contentResolver, "Ferrydrop image", uri))
+            }
+            clipboardFrom.value = from
+            scope.launch {
+                delay(3000)
+                if (clipboardFrom.value == from) clipboardFrom.value = null
+            }
         }
 
         override fun incoming(request: IncomingRequest) {
@@ -294,7 +436,7 @@ object Core {
             // Writing the clipboard is allowed from the background; only reading is restricted.
             main.post {
                 app.getSystemService(ClipboardManager::class.java)
-                    .setPrimaryClip(ClipData.newPlainText("RustDrop", text))
+                    .setPrimaryClip(ClipData.newPlainText("Ferrydrop", text))
             }
             clipboardFrom.value = from
             scope.launch {

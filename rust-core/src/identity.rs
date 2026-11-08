@@ -79,5 +79,5 @@ impl Identity {
 fn default_name() -> String {
     std::env::var("COMPUTERNAME")
         .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| "RustDrop device".into())
+        .unwrap_or_else(|_| "Ferrydrop device".into())
 }

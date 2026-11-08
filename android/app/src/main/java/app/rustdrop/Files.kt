@@ -101,7 +101,7 @@ object Files {
             val values = ContentValues().apply {
                 put(MediaStore.Downloads.DISPLAY_NAME, file.name)
                 put(MediaStore.Downloads.MIME_TYPE, mimeType(file.name))
-                put(MediaStore.Downloads.RELATIVE_PATH, listOf("Download/RustDrop", parent).filter { it.isNotEmpty() }.joinToString("/"))
+                put(MediaStore.Downloads.RELATIVE_PATH, listOf("Download/Ferrydrop", parent).filter { it.isNotEmpty() }.joinToString("/"))
                 put(MediaStore.Downloads.IS_PENDING, 1)
             }
             val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)

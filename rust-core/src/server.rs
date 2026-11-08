@@ -115,7 +115,16 @@ async fn serve(
                 let from = trusted.name.clone();
                 inbox.notify(Event::Clipboard { text, from }).await;
             }
-            Message::SendRequest { transfer_id, files } => {
+            Message::Text { text } => {
+                ensure!(text.len() <= MAX_CLIPBOARD, "text too large");
+                let from = trusted.name.clone();
+                inbox.notify(Event::Text { text, from }).await;
+            }
+            Message::SendRequest {
+                transfer_id,
+                files,
+                clipboard,
+            } => {
                 let received = transfer::receive(
                     &mut tls,
                     &peer,
@@ -123,6 +132,7 @@ async fn serve(
                     &trusted.name,
                     transfer_id,
                     files,
+                    clipboard,
                     inbox,
                 )
                 .await;
@@ -226,26 +236,34 @@ pub async fn connect(
     .await
 }
 
-/// Sends clipboard text to a trusted peer.
-pub async fn send_clipboard(
+/// Sends one message that needs no answer (clipboard text, a link) to a trusted peer.
+pub async fn send_one(
     addr: SocketAddr,
     identity: &Identity,
     trust: Arc<TrustStore>,
-    text: &str,
+    msg: &Message,
 ) -> Result<()> {
     let (mut tls, _) = connect(addr, identity, trust).await?;
-    protocol::write(&mut tls, &Message::Clipboard { text: text.into() }).await?;
+    protocol::write(&mut tls, msg).await?;
     let _ = tls.shutdown().await;
     Ok(())
 }
 
-/// Connects to a trusted peer and exchanges one PING/PONG. Returns the peer and round-trip time.
+/// Connects to a trusted peer and exchanges one PING/PONG. Returns the peer, the round-trip
+/// time and the certificate fingerprint the handshake proved.
 pub async fn ping(
     addr: SocketAddr,
     identity: &Identity,
     trust: Arc<TrustStore>,
-) -> Result<(DeviceInfo, Duration)> {
+) -> Result<(DeviceInfo, Duration, String)> {
     let (mut tls, peer) = connect(addr, identity, trust).await?;
+    let fp = tls
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|certs| certs.first())
+        .map(|cert| security::fingerprint(cert))
+        .context("peer sent no certificate")?;
     let nonce = uuid::Uuid::new_v4().as_u64_pair().0;
     let start = Instant::now();
     protocol::write(&mut tls, &Message::Ping { nonce }).await?;
@@ -254,7 +272,7 @@ pub async fn ping(
         other => bail!("expected PONG, got {other:?}"),
     };
     let _ = tls.shutdown().await; // send close_notify; failure here doesn't affect the result
-    Ok((peer, rtt))
+    Ok((peer, rtt, fp))
 }
 
 /// Client side of QR pairing: connects to the device whose fingerprint `pin` came from its QR code,
@@ -332,7 +350,7 @@ pub(crate) mod tests {
         b_trust.add(&a.fingerprint(), "a").unwrap();
 
         let s = start(b.clone(), b_trust, temp_dir("dest")).await;
-        let (peer, _) = ping(s.addr, &a, a_trust).await.unwrap();
+        let (peer, _, _) = ping(s.addr, &a, a_trust).await.unwrap();
         assert_eq!(peer.device_id, b.id);
     }
 
