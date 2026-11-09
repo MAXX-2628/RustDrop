@@ -36,7 +36,7 @@ object Shortcuts {
     // it fails with a notice); remove it on unpair once PeerInfo carries the fingerprint.
 }
 
-/** Quick Settings tile: opens Ferrydrop with the file picker, ready to send. */
+/** Quick Settings tile: opens MaxxDrop with the file picker, ready to send. */
 class SendTile : TileService() {
     // Before Android 14 the Intent overload is the only one there is.
     @android.annotation.SuppressLint("StartActivityAndCollapseDeprecated")

@@ -1,44 +1,44 @@
-# Ferrydrop
+# MaxxDrop
 
 Send files, folders, links and clipboard content between your Android phone and your Windows PC over your own network. Nothing goes through the internet or a cloud account, and every transfer is encrypted end to end.
 
 One shared Rust core does all the networking, security and file handling. The Windows app (Tauri + React) and the Android app (Kotlin + Jetpack Compose) are thin screens on top of it.
 
-Ferrydrop was called RustDrop before version 0.2.
+MaxxDrop was called RustDrop before version 0.2.
 
 ## Download
 
-Get the latest files from the [Releases page](https://github.com/MAXX-2628/Ferrydrop/releases/latest):
+Get the latest files from the [Releases page](https://github.com/MAXX-2628/MaxxDrop/releases/latest):
 
 | File | For | Notes |
 |------|-----|-------|
-| `Ferrydrop-<version>-android-universal.apk` | Android 10 or newer | One APK for every phone: 64-bit ARM, 32-bit ARM and x86_64. |
-| `Ferrydrop-<version>-windows-x64.exe` | Windows 10 or 11 (64-bit) | Portable: no installer. Needs the Microsoft Edge WebView2 runtime, which Windows 10/11 already include. |
+| `MaxxDrop-<version>-android-universal.apk` | Android 10 or newer | One APK for every phone: 64-bit ARM, 32-bit ARM and x86_64. |
+| `MaxxDrop-<version>-windows-x64.exe` | Windows 10 or 11 (64-bit) | Portable: no installer. Needs the Microsoft Edge WebView2 runtime, which Windows 10/11 already include. |
 | `SHA256SUMS.txt` | | Checksums to confirm the files arrived intact. |
 
 ### Install on Android
 
 1. Open the APK on the phone. Android asks you to allow installs from your browser or file manager the first time.
-2. Allow notifications when Ferrydrop asks. They show transfer progress, incoming requests and links.
-3. Coming from RustDrop? Ferrydrop installs as a new app next to it. Pair again, then uninstall RustDrop.
+2. Allow notifications when MaxxDrop asks. They show transfer progress, incoming requests and links.
+3. Coming from RustDrop? MaxxDrop installs as a new app next to it. Pair again, then uninstall RustDrop.
 
 ### Run on Windows
 
-1. Put `Ferrydrop-<version>-windows-x64.exe` anywhere, for example in your Documents folder, and double-click it.
+1. Put `MaxxDrop-<version>-windows-x64.exe` anywhere, for example in your Documents folder, and double-click it.
 2. The exe is not code-signed yet, so Windows SmartScreen may warn you. Choose **More info**, then **Run anyway**.
-3. If Windows Firewall asks, allow Ferrydrop on **private** networks. Other devices can't reach it otherwise.
-4. Closing the window keeps Ferrydrop in the tray, so your phone can still send to the PC. Quit it from the tray icon.
+3. If Windows Firewall asks, allow MaxxDrop on **private** networks. Other devices can't reach it otherwise.
+4. Closing the window keeps MaxxDrop in the tray, so your phone can still send to the PC. Quit it from the tray icon.
 
-Coming from RustDrop on Windows, your pairings move over automatically the first time Ferrydrop starts.
+Coming from RustDrop on Windows, your pairings move over automatically the first time MaxxDrop starts.
 
-Received files go to `Downloads\Ferrydrop` on Windows (you can choose another folder in Settings) and to `Download/Ferrydrop` on Android.
+Received files go to `Downloads\MaxxDrop` on Windows (you can choose another folder in Settings) and to `Download/MaxxDrop` on Android.
 
 ## Use it
 
 1. **Pair once.** On Windows, open **Trusted devices** and choose **Show QR code**. On the phone, open **Settings**, tap **Scan QR code** and point the camera at the PC screen. You can also type the 64-character fingerprint shown on each device.
 2. **Send.** Pick files, a folder, or a link or text, then tap the device. With two or more paired devices nearby, **Send to all** sends to each of them.
-   - On Android, use **Share → Ferrydrop** from any app. Paired devices also show at the top of the share sheet, and the **Send with Ferrydrop** Quick Settings tile opens the file picker.
-   - On Windows, drag files onto a device, or turn on **Send with Ferrydrop** in Explorer's right-click menu (Settings → Windows).
+   - On Android, use **Share → MaxxDrop** from any app. Paired devices also show at the top of the share sheet, and the **Send with MaxxDrop** Quick Settings tile opens the file picker.
+   - On Windows, drag files onto a device, or turn on **Send with MaxxDrop** in Explorer's right-click menu (Settings → Windows).
 3. **Accept.** The receiver sees who is sending what, and nothing is written until they accept. For a device you fully trust, turn on **Accept files without asking** under its name.
 
 The devices need to be on the same network. They can be on different subnets, for example the phone on Wi-Fi and the PC on a wired port behind the same router. After the first pairing, each device remembers the other's address and finds it directly.
@@ -100,7 +100,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 # Windows app (in windows\)
 pnpm install
 pnpm tauri dev                 # run with hot reload
-pnpm tauri build --no-bundle   # target\release\ferrydrop.exe
+pnpm tauri build --no-bundle   # target\release\maxxdrop.exe
 
 # Android app (in android\)
 .\gradlew assembleDebug        # app\build\outputs\apk\debug\app-debug.apk
@@ -124,3 +124,7 @@ Code names (`rustdrop-core`, the `app.rustdrop` Kotlin package, the `RUSTDROP_HO
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Developer
+
+MaxxDrop is built by **Devmaxx J4K**.

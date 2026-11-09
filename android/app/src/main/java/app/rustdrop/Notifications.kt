@@ -27,7 +27,7 @@ object Notifications {
         ctx.getSystemService(NotificationManager::class.java).createNotificationChannels(
             listOf(
                 NotificationChannel(CH_TRANSFERS, "Transfers in progress", NotificationManager.IMPORTANCE_LOW).apply {
-                    description = "Progress while Ferrydrop sends or receives files"
+                    description = "Progress while MaxxDrop sends or receives files"
                 },
                 NotificationChannel(CH_REQUESTS, "Incoming files", NotificationManager.IMPORTANCE_HIGH).apply {
                     description = "A paired device wants to send you files"
@@ -87,7 +87,7 @@ object Notifications {
         val n = Notification.Builder(ctx, CH_REQUESTS)
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setContentTitle("${request.sender} wants to send you ${if (count == 1) "a file" else "$count files"}")
-            .setContentText("Open Ferrydrop to see the files and accept.")
+            .setContentText("Open MaxxDrop to see the files and accept.")
             .setCategory(Notification.CATEGORY_CALL)
             .setContentIntent(openApp(ctx))
             .setAutoCancel(true)
@@ -162,7 +162,7 @@ class ActionReceiver : BroadcastReceiver() {
         if (intent.action == Notifications.ACTION_COPY) {
             val text = intent.getStringExtra(Notifications.EXTRA_TEXT) ?: return
             context.getSystemService(android.content.ClipboardManager::class.java)
-                .setPrimaryClip(android.content.ClipData.newPlainText("Ferrydrop", text))
+                .setPrimaryClip(android.content.ClipData.newPlainText("MaxxDrop", text))
             return
         }
         val id = intent.getStringExtra(Notifications.EXTRA_ID) ?: return

@@ -3,6 +3,7 @@ name = "rustdrop-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+authors.workspace = true
 
 [lib]
 name = "rustdrop_core"

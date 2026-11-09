@@ -14,7 +14,7 @@ android {
     compileSdk = 37
 
     defaultConfig {
-        applicationId = "app.ferrydrop" // renamed from RustDrop; the Kotlin namespace stays app.rustdrop
+        applicationId = "app.maxxdrop" // renamed from RustDrop; the Kotlin namespace stays app.rustdrop
         minSdk = 29 // MediaStore.Downloads with RELATIVE_PATH, no storage permission needed
         targetSdk = 37
         versionCode = 2

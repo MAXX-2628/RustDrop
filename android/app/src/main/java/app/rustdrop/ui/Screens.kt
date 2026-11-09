@@ -199,7 +199,7 @@ fun RustDropUi(actions: Actions) {
         },
     ) { padding ->
         Column(Modifier.padding(padding).fillMaxSize()) {
-            fatal?.let { Banner("Ferrydrop can't receive files right now: $it", Modifier.padding(sp.lg)) }
+            fatal?.let { Banner("MaxxDrop can't receive files right now: $it", Modifier.padding(sp.lg)) }
             when (tab) {
                 Tab.Home -> HomeScreen(
                     me = me,
@@ -311,7 +311,7 @@ private fun HomeScreen(
                     Empty(
                         Lucide.Smartphone,
                         "No devices nearby",
-                        "Make sure both devices are connected to the same network and Ferrydrop is running.",
+                        "Make sure both devices are connected to the same network and MaxxDrop is running.",
                     ) {
                         OutlinedButton(onClick = actions.refresh) { Text("Refresh") }
                     }
@@ -508,7 +508,7 @@ private fun ActivityScreen(transfers: List<Transfer>, actions: Actions) {
             }
         }
         if (transfers.isEmpty()) {
-            item { Empty(Lucide.History, "Nothing shared yet", "Your transfers will appear here. Ferrydrop keeps the last 200, never the files themselves.") }
+            item { Empty(Lucide.History, "Nothing shared yet", "Your transfers will appear here. MaxxDrop keeps the last 200, never the files themselves.") }
         } else {
             items(transfers, key = { it.id }) { TransferRow(it, actions) }
         }
@@ -549,7 +549,7 @@ private fun TransferRow(t: Transfer, actions: Actions) {
             left?.let { append(", ${formatDuration(it)} left") }
         }
         TransferState.VERIFYING -> "Verifying files"
-        TransferState.COMPLETED -> if (t.outgoing) "Sent and verified" else "Received and verified. Saved to Downloads/Ferrydrop."
+        TransferState.COMPLETED -> if (t.outgoing) "Sent and verified" else "Received and verified. Saved to Downloads/MaxxDrop."
         TransferState.FAILED -> t.reason?.let { "Transfer failed. $it" } ?: "Transfer failed"
         TransferState.CANCELLED -> t.reason ?: "Cancelled"
         TransferState.PAUSED -> if (t.outgoing) "Paused. Resume continues where it stopped." else t.reason ?: "Paused"
@@ -996,7 +996,7 @@ private fun SettingsScreen(
 
         item {
             Panel("This device") {
-                Text("Received files are saved to Downloads/Ferrydrop.", color = palette.textSecondary)
+                Text("Received files are saved to Downloads/MaxxDrop.", color = palette.textSecondary)
                 Text("Name: ${me.name}")
                 Text("Version: ${me.version}", color = palette.textSecondary)
             }
@@ -1031,7 +1031,7 @@ private fun ClipboardSettings(actions: Actions) {
             Switch(checked = on, onCheckedChange = null)
         }
         Text(
-            "Text and images you copy go to paired devices nearby, and what is copied there comes here. Android only lets Ferrydrop read the clipboard while it is open. Nothing is stored.",
+            "Text and images you copy go to paired devices nearby, and what is copied there comes here. Android only lets MaxxDrop read the clipboard while it is open. Nothing is stored.",
             style = MaterialTheme.typography.bodySmall,
             color = LocalPalette.current.textSecondary,
         )
@@ -1054,7 +1054,7 @@ private fun QrPairing(actions: Actions) {
         val shown = offer
         if (shown == null) {
             Text(
-                "Scan the code another Ferrydrop device shows, or show yours. Both devices are paired in one step. They need to be on the same network.",
+                "Scan the code another MaxxDrop device shows, or show yours. Both devices are paired in one step. They need to be on the same network.",
                 style = MaterialTheme.typography.bodySmall,
                 color = palette.textSecondary,
             )
@@ -1080,7 +1080,7 @@ private fun QrPairing(actions: Actions) {
                 actions.hideQr()
             }
             QrImage(shown, Modifier.align(Alignment.CenterHorizontally))
-            Text("On the other device, open Ferrydrop and scan this code.")
+            Text("On the other device, open MaxxDrop and scan this code.")
             Text(
                 "The code works once and expires in ${secondsLeft / 60}:${(secondsLeft % 60).toString().padStart(2, '0')}.",
                 style = MaterialTheme.typography.bodySmall,

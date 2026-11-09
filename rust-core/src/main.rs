@@ -37,7 +37,7 @@ async fn main() -> Result<()> {
 
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["id"] => {
-            println!("Ferrydrop core v{VERSION} (protocol {PROTOCOL_VERSION})");
+            println!("MaxxDrop core v{VERSION} (protocol {PROTOCOL_VERSION})");
             println!("name:        {}", identity.name);
             println!("id:          {}", identity.id);
             println!("fingerprint: {}", identity.fingerprint());

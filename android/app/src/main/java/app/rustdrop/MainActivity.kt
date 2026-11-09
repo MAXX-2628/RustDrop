@@ -60,7 +60,7 @@ class MainActivity : ComponentActivity() {
             openLink = { url ->
                 if (isLink(url)) runCatching { startActivity(Intent(Intent.ACTION_VIEW, url.toUri())) }
             },
-            copyText = { text -> copy(text, "Ferrydrop") },
+            copyText = { text -> copy(text, "MaxxDrop") },
             pause = Core::pause,
             resume = Core::resume,
             clearHistory = Core::clearHistory,
@@ -72,7 +72,7 @@ class MainActivity : ComponentActivity() {
             respond = Core::respond,
             pair = Core::pair,
             unpair = Core::unpair,
-            copy = { text -> copy(text, "Ferrydrop fingerprint") },
+            copy = { text -> copy(text, "MaxxDrop fingerprint") },
             openDownloads = { startActivity(Intent(DownloadManager.ACTION_VIEW_DOWNLOADS)) },
             scanQr = {
                 scanQr.launch(

@@ -138,7 +138,7 @@ export const events = {
   clipboard: (f: (from: string) => void) => listen<string>("clipboard", (e) => f(e.payload)),
   /** A link or text sent on purpose: [text, from]. */
   text: (f: (text: string, from: string) => void) => listen<[string, string]>("text", (e) => f(...e.payload)),
-  /** Paths from "Send with Ferrydrop" in Explorer while Ferrydrop was already running. */
+  /** Paths from "Send with MaxxDrop" in Explorer while MaxxDrop was already running. */
   staged: (f: (paths: string[]) => void) => listen<string[]>("staged", (e) => f(e.payload)),
 };
 
@@ -147,9 +147,9 @@ export const ACTIVE: TransferState[] = ["WAITING_FOR_ACCEPT", "TRANSFERRING", "V
 export const isLink = (text: string) => /^https?:\/\/[^\s"]+$/.test(text) && text.length < 4096;
 
 export function fromHistory(h: HistoryEntry): Transfer {
-  // The files of a paused send are only held while Ferrydrop runs.
+  // The files of a paused send are only held while MaxxDrop runs.
   if (h.state === "PAUSED") {
-    h = { ...h, state: "CANCELLED", reason: "Paused, then Ferrydrop closed. Send the files again to continue." };
+    h = { ...h, state: "CANCELLED", reason: "Paused, then MaxxDrop closed. Send the files again to continue." };
   }
   return {
     id: h.id,

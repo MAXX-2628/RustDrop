@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-The product is called **Ferrydrop** (renamed from RustDrop in 0.2). Code names keep the old name: crate `rustdrop-core`, Kotlin package `app.rustdrop`, `RUSTDROP_HOME`, mDNS `_rustdrop._tcp`, `rustdrop://` pairing links and `.rustdrop-*` staging folders. `config::data_dir` moves an old `%APPDATA%\RustDrop` to `%APPDATA%\Ferrydrop` once (if the old app still holds it open, it keeps using the old folder until the move works).
+The product is called **MaxxDrop** (renamed from RustDrop in 0.2). Code names keep the old name: crate `rustdrop-core`, Kotlin package `app.rustdrop`, `RUSTDROP_HOME`, mDNS `_rustdrop._tcp`, `rustdrop://` pairing links and `.rustdrop-*` staging folders. `config::data_dir` moves an old `%APPDATA%\RustDrop` to `%APPDATA%\MaxxDrop` once (if the old app still holds it open, it keeps using the old folder until the move works).
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
@@ -36,12 +36,12 @@ Windows app (run these in `windows\`):
 pnpm install
 pnpm tauri dev                # Vite dev server + app with hot reload
 pnpm build                    # type-check (tsc) + Vite build only
-pnpm tauri build --no-bundle  # release exe at target\release\ferrydrop.exe
+pnpm tauri build --no-bundle  # release exe at target\release\maxxdrop.exe
 pnpm tauri build              # NSIS installer
 ```
 
 - pnpm 12 enforces a minimum release age. Don't add `minimumReleaseAgeExclude`; pin an older version instead. Project rule: npm packages and crates must be at least 14 days old.
-- A running `ferrydrop.exe` locks the release build. Quit it from the tray (closing the window only hides it) before rebuilding.
+- A running `maxxdrop.exe` locks the release build. Quit it from the tray (closing the window only hides it) before rebuilding.
 
 Android app (run these in `android\`):
 
@@ -67,7 +67,7 @@ The big picture:
   - Windows: Tauri 2 + React/TypeScript in `windows\`.
   - Android: Kotlin + Jetpack Compose in `android\`.
 - Core modules that exist now:
-  - `identity` creates a UUID, a display name and a self-signed rcgen certificate on first run and stores them in the data dir (`RUSTDROP_HOME`, otherwise `%APPDATA%\Ferrydrop`).
+  - `identity` creates a UUID, a display name and a self-signed rcgen certificate on first run and stores them in the data dir (`RUSTDROP_HOME`, otherwise `%APPDATA%\MaxxDrop`).
   - `security` runs TLS 1.3 only, where both sides present a certificate. A peer is accepted only if its SHA-256 certificate fingerprint is in `trusted.json`; handshake signatures are still verified by rustls. It uses the `ring` crypto backend everywhere, because aws-lc-rs needs extra native tooling.
   - `protocol` frames messages as a u32 BE length plus JSON, with a 1 MiB cap (sized for a SEND_REQUEST listing 1000 files).
   - `config` resolves the data and downloads folders (`RUSTDROP_HOME` and `RUSTDROP_DOWNLOADS` override them). The CLI and the apps share it.
@@ -123,18 +123,18 @@ The big picture:
   - With `--features uniffi`, the same types are exported to Kotlin in package `app.rustdrop.core`. Settings are in `rust-core\uniffi.toml`, including `android = true`. `NodeError` is a `flat_error`, so Kotlin sees its Display text.
 - Windows app: `windows\src-tauri\src\main.rs` is a thin Tauri shell over `node`.
   - Its `Listener` emits webview events (`peers`, `incoming`, `transfer`, `fatal`), and each command calls the matching `Node` method.
-  - Commands that live only in the shell: `open_downloads`, `reveal`, `open_link` (http/https only), `autostart`/`set_autostart` (HKCU `Run` value with `--hidden`), `explorer_menu`/`set_explorer_menu` (HKCU `Software\Classes\*\shell\Ferrydrop` and `Software\Classes\Directory\shell\Ferrydrop`) and `take_launch_paths`. Both registry entries are rewritten on start, because the portable exe can move.
-  - `tauri-plugin-single-instance` makes a second launch (each Explorer "Send with Ferrydrop" is one) hand its paths to the running app as a `staged` event. Closing the window hides it to the tray; Quit is in the tray menu. The window starts hidden (`visible: false`) and is shown unless `--hidden`.
+  - Commands that live only in the shell: `open_downloads`, `reveal`, `open_link` (http/https only), `autostart`/`set_autostart` (HKCU `Run` value with `--hidden`), `explorer_menu`/`set_explorer_menu` (HKCU `Software\Classes\*\shell\MaxxDrop` and `Software\Classes\Directory\shell\MaxxDrop`) and `take_launch_paths`. Both registry entries are rewritten on start, because the portable exe can move.
+  - `tauri-plugin-single-instance` makes a second launch (each Explorer "Send with MaxxDrop" is one) hand its paths to the running app as a `staged` event. Closing the window hides it to the tray; Quit is in the tray menu. The window starts hidden (`visible: false`) and is shown unless `--hidden`.
   - The shell also posts system notifications (a request while the window is unfocused, and cancellations) and runs the clipboard watcher.
 - Android app: `android\app\src\main\java\app\rustdrop\`.
   - `Core` (in `RustDropApp.kt`) creates the `Node` and exposes `StateFlow`s to Compose.
   - The `Application` holds a multicast lock; without it Android drops mDNS packets.
-  - `Files.kt` opens picked or shared content URIs as `ParcelFileDescriptor`s, and `Core.send` hands duplicates to `Node::send_fds`, so nothing is copied. Only a provider that streams (`statSize` < 0, a pipe) gets copied to cache, and that copy's name is deleted at once. Received files are verified in app storage, then published to `Download/Ferrydrop` through MediaStore; a local copy is deleted only after it's fully written.
+  - `Files.kt` opens picked or shared content URIs as `ParcelFileDescriptor`s, and `Core.send` hands duplicates to `Node::send_fds`, so nothing is copied. Only a provider that streams (`statSize` < 0, a pipe) gets copied to cache, and that copy's name is deleted at once. Received files are verified in app storage, then published to `Download/MaxxDrop` through MediaStore; a local copy is deleted only after it's fully written.
   - `TransferService` is a dataSync foreground service that runs while any transfer is active.
   - `Notifications.kt`: the ongoing transfer notification has a Cancel action and is a Live Update (`ProgressStyle` + `EXTRA_REQUEST_PROMOTED_ONGOING`) on API 36+. A request that arrives in the background gets a notification with Decline. `ActionReceiver` handles both buttons.
   - `TransferIsland` (`ui\Screens.kt`) is the in-app "dynamic island": the accept prompt, a progress pill (tap to expand, with Cancel), then the result for 3 s. It always uses the dark palette (`LocalIsland`).
   - minSdk is 29, the lowest that allows MediaStore Downloads without a storage permission.
-  - applicationId is `app.ferrydrop`; the Kotlin namespace and package stay `app.rustdrop`.
+  - applicationId is `app.maxxdrop`; the Kotlin namespace and package stay `app.rustdrop`.
   - `Shortcuts.kt`: Direct Share (dynamic long-lived shortcuts per listed paired device, category in `res/xml/shortcuts.xml`; the share intent carries the device id as `EXTRA_SHORTCUT_ID`) and the `SendTile` Quick Settings tile (opens the file picker). A shared `EXTRA_TEXT` without files becomes a staged link or text.
   - QR scanning uses `zxing-android-embedded`, whose scanner asks for the camera permission itself. The manifest makes the camera optional and lets the scanner rotate.
   - Don't name a command after a local variable in `main()`. The generated macro picks up the variable instead (this happened with `trust`).

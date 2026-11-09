@@ -1,4 +1,4 @@
-//! Ferrydrop for Windows: a thin Tauri shell over `rustdrop_core::node`.
+//! MaxxDrop for Windows: a thin Tauri shell over `rustdrop_core::node`.
 //! The UI only shows state and issues commands; networking, trust and transfers stay in the core.
 //! The shell adds what only Windows has: the tray, autostart, the Explorer menu and the clipboard.
 
@@ -37,12 +37,12 @@ type Answer<T> = Result<T, String>;
 const HIDDEN: &str = "--hidden";
 
 /// Forwards core events to the webview, and raises Windows notifications for what the user
-/// must see even when Ferrydrop is in the background: a request to accept, links, cancellations.
+/// must see even when MaxxDrop is in the background: a request to accept, links, cancellations.
 struct Events {
     app: AppHandle,
     /// Transfer id -> other device's name (the first update of each transfer carries it).
     peers: Mutex<HashMap<String, String>>,
-    /// Clipboard sequence number right after Ferrydrop wrote it, so the watcher skips it.
+    /// Clipboard sequence number right after MaxxDrop wrote it, so the watcher skips it.
     ours: Arc<AtomicU32>,
 }
 
@@ -89,7 +89,7 @@ impl Listener for Events {
             };
             self.notify(
                 &format!("{} wants to send you {what}", request.sender),
-                "Open Ferrydrop to accept or decline.",
+                "Open MaxxDrop to accept or decline.",
             );
         }
         let _ = self.app.emit("incoming", request);
@@ -302,7 +302,7 @@ fn reveal(node: State<Shared>, path: PathBuf) -> Answer<()> {
         .canonicalize()
         .map_err(|_| "That file was moved or deleted.".to_string())?;
     if !target.starts_with(&root) {
-        return Err("Only files in the Ferrydrop downloads folder can be shown.".into());
+        return Err("Only files in the MaxxDrop downloads folder can be shown.".into());
     }
     let mut select = std::ffi::OsString::from("/select,");
     select.push(target.as_os_str());
@@ -366,7 +366,7 @@ fn set_explorer_menu(enabled: bool) -> Answer<()> {
     result.map_err(|e| format!("Couldn't change the Explorer menu: {e}"))
 }
 
-/// Paths Explorer passed when it started Ferrydrop ("Send with Ferrydrop"), handed to the UI once.
+/// Paths Explorer passed when it started MaxxDrop ("Send with MaxxDrop"), handed to the UI once.
 #[tauri::command]
 fn take_launch_paths(launch: State<Launch>) -> Vec<String> {
     std::mem::take(&mut *launch.0.lock().unwrap())
@@ -382,12 +382,12 @@ fn paths_in(args: impl IntoIterator<Item = String>) -> Vec<String> {
         .collect()
 }
 
-const APP: &str = "Ferrydrop";
+const APP: &str = "MaxxDrop";
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-/// "Send with Ferrydrop" on files and on folders (per user, no admin rights).
+/// "Send with MaxxDrop" on files and on folders (per user, no admin rights).
 const MENU_KEYS: [&str; 2] = [
-    r"Software\Classes\*\shell\Ferrydrop",
-    r"Software\Classes\Directory\shell\Ferrydrop",
+    r"Software\Classes\*\shell\MaxxDrop",
+    r"Software\Classes\Directory\shell\MaxxDrop",
 ];
 
 fn exe() -> Answer<String> {
@@ -399,7 +399,7 @@ fn exe() -> Answer<String> {
 fn add_explorer_menu() -> std::io::Result<()> {
     let exe = exe().map_err(std::io::Error::other)?;
     for key in MENU_KEYS {
-        reg::set(key, None, "Send with Ferrydrop")?;
+        reg::set(key, None, "Send with MaxxDrop")?;
         reg::set(key, Some("Icon"), &exe)?;
         reg::set(
             &format!("{key}\\command"),
@@ -492,7 +492,7 @@ mod reg {
 
 /// Polls the clipboard sequence number every 500 ms while sync is on, and reads the clipboard
 /// only when it changed (DESIGN target: under 500 ms latency). Text goes as text; an image is
-/// sent as a PNG. Writes Ferrydrop made itself are skipped, so nothing bounces back.
+/// sent as a PNG. Writes MaxxDrop made itself are skipped, so nothing bounces back.
 fn watch_clipboard(node: Shared, ours: Arc<AtomicU32>, scratch: PathBuf) {
     std::thread::spawn(move || {
         let mut seen: Option<u32> = None;
@@ -541,11 +541,11 @@ fn show_main(app: &AppHandle) {
 }
 
 fn tray(app: &tauri::App) -> tauri::Result<()> {
-    let open = MenuItem::with_id(app, "open", "Open Ferrydrop", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "Quit Ferrydrop", true, None::<&str>)?;
+    let open = MenuItem::with_id(app, "open", "Open MaxxDrop", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit MaxxDrop", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&open, &quit])?;
     let mut tray = TrayIconBuilder::new()
-        .tooltip("Ferrydrop")
+        .tooltip("MaxxDrop")
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, e| match e.id.as_ref() {
@@ -608,7 +608,7 @@ fn main() {
             }
             Ok(())
         })
-        // Closing the window keeps Ferrydrop in the tray, so phones can still send to this PC.
+        // Closing the window keeps MaxxDrop in the tray, so phones can still send to this PC.
         .on_window_event(move |window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 api.prevent_close();
@@ -618,7 +618,7 @@ fn main() {
                         .app_handle()
                         .notification()
                         .builder()
-                        .title("Ferrydrop is still running")
+                        .title("MaxxDrop is still running")
                         .body("It keeps receiving in the tray. Right-click the tray icon to quit.")
                         .show();
                 }
@@ -656,5 +656,5 @@ fn main() {
             take_launch_paths
         ])
         .run(tauri::generate_context!())
-        .expect("run Ferrydrop");
+        .expect("run MaxxDrop");
 }

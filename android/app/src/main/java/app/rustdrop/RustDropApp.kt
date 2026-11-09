@@ -68,7 +68,7 @@ private fun HistoryEntry.toTransfer(): Transfer {
         total = total.toLong(),
         done = if (state == TransferState.COMPLETED) total.toLong() else 0,
         state = if (paused) TransferState.CANCELLED else state,
-        reason = if (paused) "Paused, then Ferrydrop closed. Send the files again to continue." else reason,
+        reason = if (paused) "Paused, then MaxxDrop closed. Send the files again to continue." else reason,
         savedCount = saved.size,
         startedAt = finished.toLong() * 1000,
     )
@@ -388,7 +388,7 @@ object Core {
             val uri = androidx.core.content.FileProvider.getUriForFile(app, clipAuthority, dest)
             main.post {
                 app.getSystemService(ClipboardManager::class.java)
-                    .setPrimaryClip(ClipData.newUri(app.contentResolver, "Ferrydrop image", uri))
+                    .setPrimaryClip(ClipData.newUri(app.contentResolver, "MaxxDrop image", uri))
             }
             clipboardFrom.value = from
             scope.launch {
@@ -436,7 +436,7 @@ object Core {
             // Writing the clipboard is allowed from the background; only reading is restricted.
             main.post {
                 app.getSystemService(ClipboardManager::class.java)
-                    .setPrimaryClip(ClipData.newPlainText("Ferrydrop", text))
+                    .setPrimaryClip(ClipData.newPlainText("MaxxDrop", text))
             }
             clipboardFrom.value = from
             scope.launch {

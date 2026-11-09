@@ -151,7 +151,7 @@ export function App() {
         reloadTrusted();
       }),
       events.text((text, from) => setTexts((list) => [{ text, from, at: Date.now() }, ...list].slice(0, 5))),
-      // "Send with Ferrydrop" in Explorer: each file arrives on its own, so collect them.
+      // "Send with MaxxDrop" in Explorer: each file arrives on its own, so collect them.
       events.staged((paths) => {
         setStaged((list) => [...list, ...paths.filter((p) => !list.includes(p))]);
         setView("home");
@@ -292,7 +292,7 @@ export function App() {
         <nav className="sidebar" aria-label="Main">
           <div className="brand">
             <img src={logo} alt="" width={28} height={28} />
-            <span>Ferrydrop</span>
+            <span>MaxxDrop</span>
           </div>
           {NAV.map((n) => (
             <button
@@ -317,7 +317,7 @@ export function App() {
           {fatal && (
             <p className="banner" role="alert">
               <CircleAlert size={18} aria-hidden />
-              Ferrydrop can't receive files right now: {fatal}
+              MaxxDrop can't receive files right now: {fatal}
             </p>
           )}
           {view === "home" && (
@@ -529,7 +529,7 @@ function HomeView(props: {
             <Empty
               icon={<Monitor size={28} aria-hidden />}
               title="No devices nearby"
-              text="Make sure both devices are connected to the same network and Ferrydrop is running."
+              text="Make sure both devices are connected to the same network and MaxxDrop is running."
               action={
                 <button className="btn secondary" onClick={props.onRefresh}>
                   <RefreshCw size={16} aria-hidden />
@@ -670,7 +670,7 @@ function ActivityView(props: { transfers: Transfer[]; actions: TransferActions; 
         <Empty
           icon={<History size={28} aria-hidden />}
           title="Nothing shared yet"
-          text="Your transfers will appear here. Ferrydrop keeps the last 200, and never the files themselves."
+          text="Your transfers will appear here. MaxxDrop keeps the last 200, and never the files themselves."
         />
       ) : (
         <TransferList transfers={props.transfers} actions={props.actions} />
@@ -835,7 +835,7 @@ function IncomingDialog({ request, onAnswer }: { request: IncomingRequest; onAns
           ))}
           {request.count > shown.length && <li className="more">and {request.count - shown.length} more</li>}
         </ul>
-        <p className="caption">Files are checked before they're saved to your Ferrydrop downloads folder.</p>
+        <p className="caption">Files are checked before they're saved to your MaxxDrop downloads folder.</p>
         <div className="dialog-actions">
           <button ref={decline} className="btn secondary" onClick={() => onAnswer(request, false)}>
             Decline
@@ -959,7 +959,7 @@ function TrustedView(props: {
             <QrImage offer={offer} />
             <div className="qr-text">
               <p>
-                On the other device, open Ferrydrop, go to Settings and tap <strong>Scan QR code</strong>. Both devices
+                On the other device, open MaxxDrop, go to Settings and tap <strong>Scan QR code</strong>. Both devices
                 will be paired.
               </p>
               <p className="caption" aria-live="polite">
@@ -1214,7 +1214,7 @@ function SettingsView(props: {
         </label>
         <p className="caption">
           Text and images you copy go to paired devices nearby, and what is copied there comes here, over the
-          encrypted connection. Ferrydrop keeps no history of it. Turn it on on each device that should take part.
+          encrypted connection. MaxxDrop keeps no history of it. Turn it on on each device that should take part.
         </p>
       </section>
       <section className="panel" aria-labelledby="win-title">
@@ -1222,15 +1222,15 @@ function SettingsView(props: {
         <label className="switch">
           <input type="checkbox" checked={autostart} onChange={(e) => toggle(api.setAutostart, setAutostartState)(e.target.checked)} />
           <span className="switch-track" aria-hidden />
-          Start Ferrydrop when you sign in
+          Start MaxxDrop when you sign in
         </label>
         <label className="switch">
           <input type="checkbox" checked={menu} onChange={(e) => toggle(api.setExplorerMenu, setMenuState)(e.target.checked)} />
           <span className="switch-track" aria-hidden />
-          Show "Send with Ferrydrop" when you right-click files and folders
+          Show "Send with MaxxDrop" when you right-click files and folders
         </label>
         <p className="caption">
-          Closing the window keeps Ferrydrop in the tray, so paired devices can still send to this PC. Quit it from
+          Closing the window keeps MaxxDrop in the tray, so paired devices can still send to this PC. Quit it from
           the tray icon. On Windows 11, the Explorer item is under "Show more options".
         </p>
       </section>

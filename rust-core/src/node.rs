@@ -950,7 +950,7 @@ impl Node {
     /// row by row, true = dark) for the other device to scan.
     pub fn start_pairing(&self) -> Result<PairingOffer, NodeError> {
         let port = (*self.inner.port.lock().unwrap())
-            .ok_or_else(|| fail("Ferrydrop isn't ready to pair yet. Try again in a moment."))?;
+            .ok_or_else(|| fail("MaxxDrop isn't ready to pair yet. Try again in a moment."))?;
         let addrs = local_addrs(port);
         if addrs.is_empty() {
             return Err(fail("Connect to a Wi-Fi or wired network to pair."));
@@ -983,7 +983,7 @@ impl Node {
     /// trusting each other. Blocks for up to a few seconds per address; call it off the UI thread
     /// and never from inside an async runtime.
     pub fn pair_with_link(&self, link: String) -> Result<String, NodeError> {
-        let link = parse_link(&link).ok_or_else(|| fail("That isn't a Ferrydrop pairing code."))?;
+        let link = parse_link(&link).ok_or_else(|| fail("That isn't a MaxxDrop pairing code."))?;
         if link.fp == self.inner.identity.fingerprint() {
             return Err(fail("That's this device's own pairing code."));
         }
